@@ -124,6 +124,7 @@ def parse_arguments():
     parser.add_argument('-o', '--output', type=str, default='balances.json', help='Output file for saving balances')
     parser.add_argument('-n', '--node', type=str, required=True, help='Ethereum node URL (e.g., Infura or local)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Increase output verbosity')
+    parser.add_argument('--no-save', action='store_true', help="Do not save balances to file")
     return parser.parse_args()
 
 def main():
@@ -140,8 +141,10 @@ def main():
         addresses = load_wallet_addresses(args.input)
         web3 = connect_to_ethereum_node(args.node)
         balances = check_balances(addresses, web3)
-        print(json.dumps(balances, indent=4))
-        save_balances_to_file(balances, args.output)
+        print(json.dumps(balances, indent=4))  # Print balances to console
+
+        if not args.no_save:
+            save_balances_to_file(balances, args.output)
     except Exception as e:
         logging.error(f"An error occurred during execution: {e}")
         exit(1)
