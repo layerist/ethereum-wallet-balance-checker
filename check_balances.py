@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def load_wallet_addresses(filename):
     """
-    Load wallet addresses from a file.
+    Load wallet addresses from a file and remove duplicates.
 
     Args:
         filename (str): Path to the file containing wallet addresses.
@@ -19,14 +19,14 @@ def load_wallet_addresses(filename):
     """
     try:
         with open(filename, 'r') as file:
-            addresses = [line.strip() for line in file if line.strip()]
-        logging.info(f"Successfully loaded {len(addresses)} addresses from {filename}.")
-        return addresses
+            addresses = set(line.strip() for line in file if line.strip())
+        logging.info(f"Loaded {len(addresses)} unique addresses from {filename}.")
+        return list(addresses)
     except FileNotFoundError:
         logging.error(f"File not found: {filename}")
         raise
     except Exception as e:
-        logging.error(f"Unexpected error while reading {filename}: {e}")
+        logging.error(f"Error while reading {filename}: {e}")
         raise
 
 def connect_to_ethereum_node(node_url):
@@ -41,11 +41,10 @@ def connect_to_ethereum_node(node_url):
     """
     try:
         web3 = Web3(Web3.HTTPProvider(node_url))
-        if web3.isConnected():
-            logging.info("Successfully connected to the Ethereum node.")
-            return web3
-        else:
-            raise ConnectionError("Failed to connect to the Ethereum node. Check the URL or node status.")
+        if not web3.isConnected():
+            raise ConnectionError(f"Could not connect to the Ethereum node: {node_url}")
+        logging.info("Successfully connected to the Ethereum node.")
+        return web3
     except Exception as e:
         logging.error(f"Error connecting to Ethereum node: {e}")
         raise
