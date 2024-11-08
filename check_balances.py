@@ -10,12 +10,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def load_wallet_addresses(filename: str) -> list[str]:
     """
     Load wallet addresses from a file, remove duplicates, and return the list.
-
-    Args:
-        filename (str): Path to the file containing wallet addresses.
-
-    Returns:
-        list[str]: List of unique wallet addresses.
     """
     try:
         with open(filename, 'r') as file:
@@ -32,17 +26,11 @@ def load_wallet_addresses(filename: str) -> list[str]:
 def connect_to_ethereum_node(node_url: str) -> Web3:
     """
     Connect to an Ethereum node via the provided node URL.
-
-    Args:
-        node_url (str): Ethereum node URL.
-
-    Returns:
-        Web3: Web3 instance connected to the Ethereum node.
     """
     try:
         web3 = Web3(Web3.HTTPProvider(node_url))
         if not web3.isConnected():
-            raise ConnectionError(f"Failed to connect to Ethereum node: '{node_url}'")
+            raise ConnectionError(f"Failed to connect to Ethereum node at '{node_url}'.")
         logging.info(f"Connected to Ethereum node at '{node_url}'.")
         return web3
     except Exception as e:
@@ -51,19 +39,11 @@ def connect_to_ethereum_node(node_url: str) -> Web3:
 
 def get_wallet_balance(web3: Web3, address: str) -> float:
     """
-    Get the Ether balance of a wallet address.
-
-    Args:
-        web3 (Web3): Web3 instance.
-        address (str): Wallet address.
-
-    Returns:
-        float: Wallet balance in Ether.
+    Retrieve the Ether balance of a wallet address.
     """
     try:
         if not web3.isAddress(address):
             raise InvalidAddress(f"Invalid Ethereum address: '{address}'")
-
         balance_wei = web3.eth.get_balance(address)
         balance_eth = web3.fromWei(balance_wei, 'ether')
         logging.info(f"Balance of {address}: {balance_eth:.4f} ETH")
@@ -77,14 +57,7 @@ def get_wallet_balance(web3: Web3, address: str) -> float:
 
 def check_balances(addresses: list[str], web3: Web3) -> dict[str, str]:
     """
-    Check balances for all wallet addresses.
-
-    Args:
-        addresses (list[str]): List of wallet addresses.
-        web3 (Web3): Web3 instance connected to the Ethereum node.
-
-    Returns:
-        dict[str, str]: Dictionary of wallet addresses and their balances or error messages.
+    Check balances for a list of wallet addresses and return them as a dictionary.
     """
     balances = {}
     for address in addresses:
@@ -99,10 +72,6 @@ def check_balances(addresses: list[str], web3: Web3) -> dict[str, str]:
 def save_balances_to_file(balances: dict[str, str], filename: str) -> None:
     """
     Save wallet balances to a JSON file.
-
-    Args:
-        balances (dict[str, str]): Dictionary of wallet balances.
-        filename (str): Output file path.
     """
     try:
         with open(filename, 'w') as file:
@@ -115,9 +84,6 @@ def save_balances_to_file(balances: dict[str, str], filename: str) -> None:
 def parse_arguments() -> argparse.Namespace:
     """
     Parse and return command-line arguments.
-
-    Returns:
-        argparse.Namespace: Parsed arguments.
     """
     parser = argparse.ArgumentParser(description="Check Ethereum wallet balances.")
     parser.add_argument('-i', '--input', type=str, default='wallets.txt', help='Input file with wallet addresses.')
