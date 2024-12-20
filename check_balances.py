@@ -4,8 +4,14 @@ import argparse
 from web3 import Web3
 from web3.exceptions import InvalidAddress
 
+
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+def configure_logging(verbose: bool) -> None:
+    """
+    Configure logging level and format based on verbosity.
+    """
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 def load_wallet_addresses(filename: str) -> list[str]:
@@ -49,7 +55,7 @@ def get_wallet_balance(web3: Web3, address: str) -> float:
             raise InvalidAddress(f"Invalid Ethereum address: '{address}'")
         balance_wei = web3.eth.get_balance(address)
         balance_eth = web3.fromWei(balance_wei, "ether")
-        logging.info(f"Balance of {address}: {balance_eth:.4f} ETH")
+        logging.debug(f"Balance of {address}: {balance_eth:.4f} ETH")
         return balance_eth
     except InvalidAddress as e:
         logging.error(e)
@@ -69,7 +75,7 @@ def check_balances(addresses: list[str], web3: Web3) -> dict[str, str]:
             balance = get_wallet_balance(web3, address)
             balances[address] = f"{balance:.4f} ETH"
         except Exception as e:
-            balances[address] = f"Error: {e}"
+            balances[address] = f"Error: {str(e)}"
             logging.debug(f"Error retrieving balance for {address}: {e}")
     return balances
 
@@ -116,9 +122,8 @@ def main() -> None:
     """
     args = parse_arguments()
 
-    # Set logging level based on verbosity
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # Configure logging
+    configure_logging(args.verbose)
 
     try:
         # Load wallet addresses
