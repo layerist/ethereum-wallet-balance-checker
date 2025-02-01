@@ -18,6 +18,16 @@ def configure_logging(verbose: bool) -> None:
 def load_wallet_addresses(filename: str) -> list[str]:
     """
     Load wallet addresses from a file, removing duplicates and empty lines.
+    
+    Args:
+        filename (str): Path to the file containing wallet addresses.
+    
+    Returns:
+        list[str]: List of unique wallet addresses.
+    
+    Raises:
+        ValueError: If no valid addresses are found in the file.
+        FileNotFoundError: If the input file doesn't exist.
     """
     try:
         with open(filename, "r") as file:
@@ -37,6 +47,15 @@ def load_wallet_addresses(filename: str) -> list[str]:
 def connect_to_ethereum_node(node_url: str) -> Web3:
     """
     Connect to an Ethereum node using the provided URL.
+    
+    Args:
+        node_url (str): Ethereum node URL (e.g., Infura or local node).
+    
+    Returns:
+        Web3: An instance of Web3 connected to the node.
+    
+    Raises:
+        ConnectionError: If the connection to the Ethereum node fails.
     """
     try:
         web3 = Web3(Web3.HTTPProvider(node_url))
@@ -52,6 +71,16 @@ def connect_to_ethereum_node(node_url: str) -> Web3:
 def get_wallet_balance(web3: Web3, address: str) -> float:
     """
     Get the Ether balance of a wallet address in ETH.
+    
+    Args:
+        web3 (Web3): Web3 instance to interact with Ethereum.
+        address (str): Ethereum wallet address.
+    
+    Returns:
+        float: Balance in Ether.
+    
+    Raises:
+        InvalidAddress: If the address is not valid.
     """
     try:
         if not web3.isAddress(address):
@@ -61,7 +90,7 @@ def get_wallet_balance(web3: Web3, address: str) -> float:
         logging.debug(f"Address {address}: Balance = {balance_eth:.4f} ETH")
         return balance_eth
     except InvalidAddress as e:
-        logging.error(e)
+        logging.error(f"Invalid address '{address}': {e}")
         raise
     except Exception as e:
         logging.error(f"Failed to fetch balance for address '{address}': {e}")
@@ -71,6 +100,13 @@ def get_wallet_balance(web3: Web3, address: str) -> float:
 def check_balances(addresses: list[str], web3: Web3) -> dict[str, str]:
     """
     Retrieve balances for a list of wallet addresses.
+    
+    Args:
+        addresses (list[str]): List of wallet addresses to check.
+        web3 (Web3): Web3 instance to interact with Ethereum.
+    
+    Returns:
+        dict[str, str]: Dictionary mapping addresses to their balance in ETH or error messages.
     """
     balances = {}
     for address in addresses:
@@ -86,6 +122,13 @@ def check_balances(addresses: list[str], web3: Web3) -> dict[str, str]:
 def save_balances_to_file(balances: dict[str, str], filename: str) -> None:
     """
     Save wallet balances to a JSON file.
+    
+    Args:
+        balances (dict[str, str]): Dictionary of wallet addresses and their balances.
+        filename (str): Path to the output file.
+    
+    Raises:
+        IOError: If an error occurs while writing to the file.
     """
     try:
         with open(filename, "w") as file:
@@ -99,6 +142,9 @@ def save_balances_to_file(balances: dict[str, str], filename: str) -> None:
 def parse_arguments() -> argparse.Namespace:
     """
     Parse command-line arguments.
+    
+    Returns:
+        argparse.Namespace: Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(description="Ethereum Wallet Balance Checker")
     parser.add_argument(
