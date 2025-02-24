@@ -1,198 +1,119 @@
 import json
 import logging
 import argparse
+from typing import List, Dict
 from web3 import Web3
 from web3.exceptions import InvalidAddress
 
 
 def configure_logging(verbose: bool) -> None:
-    """
-    Configure logging level and format based on verbosity.
-    """
+    """Configure logging level and format."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
 
-def load_wallet_addresses(filename: str) -> list[str]:
-    """
-    Load wallet addresses from a file, removing duplicates and empty lines.
-    
-    Args:
-        filename (str): Path to the file containing wallet addresses.
-    
-    Returns:
-        list[str]: List of unique wallet addresses.
-    
-    Raises:
-        ValueError: If no valid addresses are found in the file.
-        FileNotFoundError: If the input file doesn't exist.
-    """
+def load_wallet_addresses(filename: str) -> List[str]:
+    """Load unique wallet addresses from a file."""
     try:
-        with open(filename, "r") as file:
+        with open(filename, "r", encoding="utf-8") as file:
             addresses = {line.strip() for line in file if line.strip()}
+
         if not addresses:
-            raise ValueError("The input file contains no valid addresses.")
+            raise ValueError("No valid wallet addresses found in the input file.")
+
         logging.info(f"Loaded {len(addresses)} unique wallet addresses from '{filename}'.")
         return list(addresses)
+
     except FileNotFoundError:
-        logging.error(f"File '{filename}' not found. Please provide a valid input file.")
+        logging.error(f"File '{filename}' not found. Provide a valid file.")
         raise
     except Exception as e:
-        logging.error(f"Error reading from '{filename}': {e}")
+        logging.error(f"Error reading file '{filename}': {e}")
         raise
 
 
 def connect_to_ethereum_node(node_url: str) -> Web3:
-    """
-    Connect to an Ethereum node using the provided URL.
-    
-    Args:
-        node_url (str): Ethereum node URL (e.g., Infura or local node).
-    
-    Returns:
-        Web3: An instance of Web3 connected to the node.
-    
-    Raises:
-        ConnectionError: If the connection to the Ethereum node fails.
-    """
-    try:
-        web3 = Web3(Web3.HTTPProvider(node_url))
-        if not web3.isConnected():
-            raise ConnectionError(f"Unable to connect to Ethereum node at '{node_url}'.")
-        logging.info(f"Successfully connected to Ethereum node at '{node_url}'.")
-        return web3
-    except Exception as e:
-        logging.error(f"Error connecting to Ethereum node '{node_url}': {e}")
-        raise
+    """Establish connection to an Ethereum node."""
+    web3 = Web3(Web3.HTTPProvider(node_url))
+    if not web3.is_connected():
+        raise ConnectionError(f"Failed to connect to Ethereum node at '{node_url}'.")
+
+    logging.info(f"Connected to Ethereum node at '{node_url}'.")
+    return web3
 
 
 def get_wallet_balance(web3: Web3, address: str) -> float:
-    """
-    Get the Ether balance of a wallet address in ETH.
-    
-    Args:
-        web3 (Web3): Web3 instance to interact with Ethereum.
-        address (str): Ethereum wallet address.
-    
-    Returns:
-        float: Balance in Ether.
-    
-    Raises:
-        InvalidAddress: If the address is not valid.
-    """
+    """Retrieve the ETH balance of a wallet."""
     try:
-        if not web3.isAddress(address):
-            raise InvalidAddress(f"Invalid Ethereum address: '{address}'.")
+        if not web3.is_address(address):
+            raise InvalidAddress(f"Invalid Ethereum address: {address}")
+
         balance_wei = web3.eth.get_balance(address)
-        balance_eth = web3.fromWei(balance_wei, "ether")
-        logging.debug(f"Address {address}: Balance = {balance_eth:.4f} ETH")
+        balance_eth = web3.from_wei(balance_wei, "ether")
+        logging.debug(f"Address {address}: {balance_eth:.4f} ETH")
         return balance_eth
+
     except InvalidAddress as e:
         logging.error(f"Invalid address '{address}': {e}")
         raise
     except Exception as e:
-        logging.error(f"Failed to fetch balance for address '{address}': {e}")
+        logging.error(f"Error fetching balance for '{address}': {e}")
         raise
 
 
-def check_balances(addresses: list[str], web3: Web3) -> dict[str, str]:
-    """
-    Retrieve balances for a list of wallet addresses.
-    
-    Args:
-        addresses (list[str]): List of wallet addresses to check.
-        web3 (Web3): Web3 instance to interact with Ethereum.
-    
-    Returns:
-        dict[str, str]: Dictionary mapping addresses to their balance in ETH or error messages.
-    """
+def check_balances(web3: Web3, addresses: List[str]) -> Dict[str, str]:
+    """Fetch balances for multiple wallet addresses."""
     balances = {}
     for address in addresses:
         try:
-            balance = get_wallet_balance(web3, address)
-            balances[address] = f"{balance:.4f} ETH"
+            balances[address] = f"{get_wallet_balance(web3, address):.4f} ETH"
         except Exception as e:
             balances[address] = f"Error: {e}"
-            logging.debug(f"Error retrieving balance for {address}: {e}")
+            logging.debug(f"Failed to retrieve balance for {address}: {e}")
     return balances
 
 
-def save_balances_to_file(balances: dict[str, str], filename: str) -> None:
-    """
-    Save wallet balances to a JSON file.
-    
-    Args:
-        balances (dict[str, str]): Dictionary of wallet addresses and their balances.
-        filename (str): Path to the output file.
-    
-    Raises:
-        IOError: If an error occurs while writing to the file.
-    """
+def save_balances_to_file(balances: Dict[str, str], filename: str) -> None:
+    """Save wallet balances to a JSON file."""
     try:
-        with open(filename, "w") as file:
+        with open(filename, "w", encoding="utf-8") as file:
             json.dump(balances, file, indent=4)
-        logging.info(f"Balances successfully saved to '{filename}'.")
+        logging.info(f"Balances saved to '{filename}'.")
     except IOError as e:
         logging.error(f"Error saving balances to file '{filename}': {e}")
         raise
 
 
 def parse_arguments() -> argparse.Namespace:
-    """
-    Parse command-line arguments.
-    
-    Returns:
-        argparse.Namespace: Parsed command-line arguments.
-    """
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Ethereum Wallet Balance Checker")
-    parser.add_argument(
-        "-i", "--input", type=str, default="wallets.txt", help="Input file with wallet addresses."
-    )
-    parser.add_argument(
-        "-o", "--output", type=str, default="balances.json", help="Output file to save wallet balances."
-    )
-    parser.add_argument(
-        "-n", "--node", type=str, required=True, help="Ethereum node URL (e.g., Infura or local node)."
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable verbose logging output."
-    )
-    parser.add_argument(
-        "--no-save", action="store_true", help="Skip saving balances to a file."
-    )
+    parser.add_argument("-i", "--input", type=str, default="wallets.txt", help="Input file with wallet addresses.")
+    parser.add_argument("-o", "--output", type=str, default="balances.json", help="Output file to save wallet balances.")
+    parser.add_argument("-n", "--node", type=str, required=True, help="Ethereum node URL (e.g., Infura or local node).")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging output.")
+    parser.add_argument("--no-save", action="store_true", help="Skip saving balances to a file.")
     return parser.parse_args()
 
 
 def main() -> None:
-    """
-    Main execution function for checking Ethereum wallet balances.
-    """
+    """Main execution function."""
     args = parse_arguments()
-
-    # Configure logging
     configure_logging(args.verbose)
 
     try:
-        # Load wallet addresses
         addresses = load_wallet_addresses(args.input)
-
-        # Connect to Ethereum node
         web3 = connect_to_ethereum_node(args.node)
+        balances = check_balances(web3, addresses)
 
-        # Check balances
-        balances = check_balances(addresses, web3)
-
-        # Display balances
         print(json.dumps(balances, indent=4))
 
-        # Save balances to file (if not skipped)
         if not args.no_save:
             save_balances_to_file(balances, args.output)
 
     except Exception as e:
-        logging.error(f"Program execution failed: {e}")
+        logging.error(f"Execution failed: {e}")
         exit(1)
 
 
