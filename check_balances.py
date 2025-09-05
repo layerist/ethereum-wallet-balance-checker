@@ -7,7 +7,6 @@ from typing import List, Dict, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from web3 import Web3
 from web3.exceptions import InvalidAddress
-from functools import partial
 
 try:
     from tqdm import tqdm
@@ -32,7 +31,6 @@ def load_wallet_addresses(file_path: Union[str, Path]) -> List[str]:
     """Load, normalize, and validate Ethereum addresses from a file."""
     path = Path(file_path)
     if not path.is_file():
-        logging.error(f"Input file does not exist: {path}")
         raise FileNotFoundError(f"Input file not found: {path}")
 
     with path.open("r", encoding="utf-8") as f:
@@ -44,7 +42,9 @@ def load_wallet_addresses(file_path: Union[str, Path]) -> List[str]:
             try:
                 valid.append(Web3.to_checksum_address(addr))
             except Exception:
-                continue
+                logging.warning(f"Invalid checksum address skipped: {addr}")
+        else:
+            logging.warning(f"Invalid address skipped: {addr}")
 
     if not valid:
         raise ValueError("No valid Ethereum addresses found in the input file.")
@@ -59,11 +59,7 @@ def connect_to_node(node_url: str) -> Web3:
     if not web3.is_connected():
         raise ConnectionError(f"Failed to connect to Ethereum node: {node_url}")
 
-    try:
-        node_version = web3.client_version
-    except Exception:
-        node_version = "Unknown"
-
+    node_version = getattr(web3, "client_version", "Unknown")
     logging.info(f"Connected to Ethereum node ({node_version}): {node_url}")
     return web3
 
@@ -79,6 +75,7 @@ def fetch_wallet_balance(web3: Web3, address: str) -> str:
             return "Error: Invalid address"
         except Exception as e:
             if attempt < RETRY_ATTEMPTS - 1:
+                logging.debug(f"Retry {attempt+1}/{RETRY_ATTEMPTS} for {address}: {e}")
                 time.sleep(RETRY_DELAY)
             else:
                 return f"Error: {e}"
@@ -89,23 +86,30 @@ def fetch_balances_concurrently(
 ) -> Dict[str, str]:
     """Fetch balances concurrently with optional progress bar."""
     results: Dict[str, str] = {}
-    task_iter = (as_completed(
-        {ThreadPoolExecutor(max_workers=max_workers).submit(fetch_wallet_balance, web3, addr): addr for addr in addresses}
-    ))
-
-    if TQDM_AVAILABLE:
-        task_iter = tqdm(task_iter, total=len(addresses), desc="Fetching balances")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(fetch_wallet_balance, web3, addr): addr for addr in addresses}
-        for future in (tqdm(as_completed(futures), total=len(addresses), desc="Fetching balances") if TQDM_AVAILABLE else as_completed(futures)):
+        iterator = as_completed(futures)
+        if TQDM_AVAILABLE:
+            iterator = tqdm(iterator, total=len(addresses), desc="Fetching balances")
+
+        for future in iterator:
             address = futures[future]
             try:
                 results[address] = future.result()
             except Exception as e:
                 logging.error(f"Unhandled exception for {address}: {e}")
                 results[address] = f"Error: {e}"
-    return dict(sorted(results.items(), key=lambda x: (x[1] != "Error" and float(x[1].split()[0]) or -1), reverse=True))
+
+    # Sort: valid numeric balances first (descending), then errors
+    def sort_key(item):
+        val = item[1]
+        try:
+            return (0, float(val.split()[0]))
+        except Exception:
+            return (1, -1)
+
+    return dict(sorted(results.items(), key=sort_key, reverse=True))
 
 
 def save_balances(balances: Dict[str, str], output_path: Union[str, Path]) -> None:
