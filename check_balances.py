@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from web3 import Web3
-from web3.exceptions import InvalidAddress
+from web3.exceptions import InvalidAddress, BlockNotFound
 
 try:
     from tqdm import tqdm
@@ -14,13 +14,14 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
 
+
 ETH_DECIMALS: int = 4
 RETRY_ATTEMPTS: int = 3
 RETRY_DELAY: float = 0.5
 
 
 def configure_logging(verbose: bool) -> None:
-    """Set up logging format and verbosity."""
+    """Configure logging format and verbosity level."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
@@ -28,7 +29,7 @@ def configure_logging(verbose: bool) -> None:
 
 
 def load_wallet_addresses(file_path: Union[str, Path]) -> List[str]:
-    """Load, normalize, and validate Ethereum addresses from a file."""
+    """Load Ethereum addresses from file and normalize them."""
     path = Path(file_path)
     if not path.is_file():
         raise FileNotFoundError(f"Input file not found: {path}")
@@ -36,55 +37,62 @@ def load_wallet_addresses(file_path: Union[str, Path]) -> List[str]:
     with path.open("r", encoding="utf-8") as f:
         raw_addresses = {line.strip() for line in f if line.strip()}
 
-    valid = []
+    valid_addresses: List[str] = []
     for addr in raw_addresses:
         if Web3.is_address(addr):
             try:
-                valid.append(Web3.to_checksum_address(addr))
+                valid_addresses.append(Web3.to_checksum_address(addr))
             except Exception:
                 logging.warning(f"Invalid checksum address skipped: {addr}")
         else:
-            logging.warning(f"Invalid address skipped: {addr}")
+            logging.warning(f"Invalid Ethereum address skipped: {addr}")
 
-    if not valid:
+    if not valid_addresses:
         raise ValueError("No valid Ethereum addresses found in the input file.")
 
-    logging.info(f"Loaded {len(valid)} valid Ethereum addresses from {path}")
-    return valid
+    logging.info(f"Loaded {len(valid_addresses)} valid addresses from {path}")
+    return valid_addresses
 
 
 def connect_to_node(node_url: str) -> Web3:
-    """Connect to Ethereum node."""
-    web3 = Web3(Web3.HTTPProvider(node_url))
+    """Establish a connection to an Ethereum node."""
+    web3 = Web3(Web3.HTTPProvider(node_url, request_kwargs={"timeout": 10}))
     if not web3.is_connected():
         raise ConnectionError(f"Failed to connect to Ethereum node: {node_url}")
 
-    node_version = getattr(web3, "client_version", "Unknown")
+    try:
+        node_version = web3.client_version
+    except Exception:
+        node_version = "Unknown"
+
     logging.info(f"Connected to Ethereum node ({node_version}): {node_url}")
     return web3
 
 
 def fetch_wallet_balance(web3: Web3, address: str) -> str:
-    """Fetch ETH balance with retry logic."""
-    for attempt in range(RETRY_ATTEMPTS):
+    """Fetch ETH balance for a single wallet with retry logic."""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             balance_wei = web3.eth.get_balance(address)
             balance_eth = web3.from_wei(balance_wei, "ether")
             return f"{balance_eth:.{ETH_DECIMALS}f} ETH"
         except InvalidAddress:
             return "Error: Invalid address"
+        except BlockNotFound as e:
+            return f"Error: Block not found ({e})"
         except Exception as e:
-            if attempt < RETRY_ATTEMPTS - 1:
-                logging.debug(f"Retry {attempt+1}/{RETRY_ATTEMPTS} for {address}: {e}")
+            if attempt < RETRY_ATTEMPTS:
+                logging.debug(f"Retry {attempt}/{RETRY_ATTEMPTS} for {address}: {e}")
                 time.sleep(RETRY_DELAY)
             else:
                 return f"Error: {e}"
+    return "Error: Unknown"
 
 
 def fetch_balances_concurrently(
     web3: Web3, addresses: List[str], max_workers: int
 ) -> Dict[str, str]:
-    """Fetch balances concurrently with optional progress bar."""
+    """Fetch balances for multiple addresses concurrently."""
     results: Dict[str, str] = {}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -101,7 +109,7 @@ def fetch_balances_concurrently(
                 logging.error(f"Unhandled exception for {address}: {e}")
                 results[address] = f"Error: {e}"
 
-    # Sort: valid numeric balances first (descending), then errors
+    # Sort: numeric balances first (descending), errors last
     def sort_key(item):
         val = item[1]
         try:
@@ -113,12 +121,12 @@ def fetch_balances_concurrently(
 
 
 def save_balances(balances: Dict[str, str], output_path: Union[str, Path]) -> None:
-    """Save balances to JSON."""
+    """Save balances to a JSON file."""
     path = Path(output_path)
     try:
         with path.open("w", encoding="utf-8") as f:
             json.dump(balances, f, indent=4, ensure_ascii=False)
-        logging.info(f"Balances saved to: {path}")
+        logging.info(f"Balances saved to {path}")
     except IOError as e:
         logging.error(f"Failed to write balances to {path}: {e}")
         raise
@@ -127,11 +135,11 @@ def save_balances(balances: Dict[str, str], output_path: Union[str, Path]) -> No
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description="Ethereum Wallet Balance Checker")
-    parser.add_argument("-i", "--input", default="wallets.txt", help="Path to input file")
-    parser.add_argument("-o", "--output", default="balances.json", help="Path to output JSON file")
-    parser.add_argument("-n", "--node", required=True, help="Ethereum node URL (e.g., Infura)")
+    parser.add_argument("-i", "--input", default="wallets.txt", help="Input file with Ethereum addresses")
+    parser.add_argument("-o", "--output", default="balances.json", help="Output JSON file")
+    parser.add_argument("-n", "--node", required=True, help="Ethereum node URL (e.g., Infura endpoint)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--no-save", action="store_true", help="Don't save balances to file")
+    parser.add_argument("--no-save", action="store_true", help="Do not save balances to a file")
     parser.add_argument("--workers", type=int, default=10, help="Number of concurrent workers")
     return parser.parse_args()
 
@@ -151,10 +159,10 @@ def main() -> None:
         if not args.no_save:
             save_balances(balances, args.output)
 
-        logging.info(f"Execution completed in {time.time() - start_time:.2f} seconds")
+        logging.info(f"Execution finished in {time.time() - start_time:.2f} seconds")
 
     except Exception as e:
-        logging.critical(f"Fatal error occurred: {e}")
+        logging.critical(f"Fatal error: {e}", exc_info=True)
         exit(1)
 
 
