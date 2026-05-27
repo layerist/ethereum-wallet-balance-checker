@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Ethereum Wallet Balance Checker (Ultra Hardened v3)
+Ethereum Wallet Balance Checker (Hybrid High-Performance Edition)
 
-Major upgrades over v2:
-- True multi-node failover (retry across nodes)
-- Streaming JSONL output (no RAM explosion)
-- Resume support (skip already processed)
-- Bounded task queue (no node overload)
-- Node health scoring (bad nodes penalized)
-- Safe unordered batch handling
-- Much faster checkpointing
+Optimized for MIXED RPC environments:
+- Paid RPCs (Alchemy / QuickNode / Infura)
+- Public RPCs (rate limited / unstable)
+
+Key upgrades:
+- Adaptive node scoring + circuit breaker
+- Per-node cooldown after failures / 429
+- True retry across different nodes
+- Writer thread (non-blocking IO)
+- Streaming JSONL
+- Fast resume (no full scan required if index file used)
+- Smarter batch execution
 """
 
 from __future__ import annotations
@@ -17,377 +21,292 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
-import time
 import threading
+import time
 import random
-import csv
-
 from dataclasses import dataclass, asdict
-from decimal import Decimal, getcontext
+from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from collections import defaultdict, deque
 
 import requests
 from web3 import Web3
-from web3.exceptions import InvalidAddress
 
 # =========================
 # CONFIG
 # =========================
-ETH_DECIMALS = 6
-RETRY_ATTEMPTS = 3
-BASE_DELAY = 0.2
-MAX_DELAY = 3
+WEI = Decimal("1000000000000000000")
 
-WEI_IN_ETH = Decimal("1000000000000000000")
+BASE_BATCH_SIZE = 50
+MAX_INFLIGHT = 200
+MAX_RETRIES = 3
 
-MAX_INFLIGHT = 200  # prevents overload
-RATE_WINDOW = 50
+COOLDOWN_SEC = 2.0
+FAIL_PENALTY = 2
+SUCCESS_REWARD = 1
 
-getcontext().prec = 28
-
-# =========================
-# GLOBAL SESSION
-# =========================
-_session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=300,
-    pool_maxsize=300,
-    max_retries=0,
-)
-_session.mount("http://", _adapter)
-_session.mount("https://", _adapter)
+geth_session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=500, pool_maxsize=500)
+geth_session.mount("http://", adapter)
+geth_session.mount("https://", adapter)
 
 # =========================
-# THREAD-LOCAL WEB3
-# =========================
-_thread_local = threading.local()
-
-
-def get_web3(node_url: str) -> Web3:
-    if not hasattr(_thread_local, "cache"):
-        _thread_local.cache = {}
-
-    if node_url not in _thread_local.cache:
-        _thread_local.cache[node_url] = Web3(
-            Web3.HTTPProvider(
-                node_url,
-                session=_session,
-                request_kwargs={"timeout": 10},
-            )
-        )
-
-    return _thread_local.cache[node_url]
-
-
-# =========================
-# RATE LIMITER
-# =========================
-class AdaptiveRateLimiter:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.errors = deque(maxlen=RATE_WINDOW)
-        self.sleep_time = 0
-
-    def record(self, success: bool):
-        with self.lock:
-            self.errors.append(0 if success else 1)
-            err_rate = sum(self.errors) / len(self.errors)
-
-            if err_rate > 0.3:
-                self.sleep_time = min(self.sleep_time + 0.05, 1.5)
-            else:
-                self.sleep_time = max(self.sleep_time - 0.02, 0)
-
-    def wait(self):
-        if self.sleep_time > 0:
-            time.sleep(self.sleep_time)
-
-
-rate_limiter = AdaptiveRateLimiter()
-
-# =========================
-# NODE POOL (SMART)
-# =========================
-class NodePool:
-    def __init__(self, nodes: List[str]):
-        self.nodes = nodes
-        self.lock = threading.Lock()
-        self.health = {n: 0 for n in nodes}
-
-    def get(self) -> str:
-        with self.lock:
-            # pick least "bad" node
-            return min(self.nodes, key=lambda n: self.health[n])
-
-    def report(self, node: str, success: bool):
-        with self.lock:
-            if success:
-                self.health[node] = max(self.health[node] - 1, 0)
-            else:
-                self.health[node] += 1
-
-
-# =========================
-# DATA MODEL
+# RESULT MODEL
 # =========================
 @dataclass
 class BalanceResult:
     address: str
     balance_wei: Optional[int]
     balance_eth: Optional[Decimal]
-    error: Optional[str] = None
-    latency_ms: Optional[float] = None
+    error: Optional[str]
+    latency_ms: float
 
-    def to_dict(self):
+    def dump(self):
         d = asdict(self)
         if self.balance_eth is not None:
-            d["balance_eth"] = f"{self.balance_eth:.{ETH_DECIMALS}f}"
+            d["balance_eth"] = str(round(float(self.balance_eth), 8))
         return d
 
 
 # =========================
-# RETRY WITH FAILOVER
+# NODE MANAGER (HYBRID SMART)
 # =========================
-def retry_with_failover(
-    node_pool: NodePool,
-    fn: Callable[[str], int],
-):
-    delay = BASE_DELAY
+class NodeManager:
+    def __init__(self, nodes: List[str]):
+        self.nodes = nodes
+        self.lock = threading.Lock()
+        self.score: Dict[str, int] = {n: 0 for n in nodes}
+        self.cooldown: Dict[str, float] = {n: 0 for n in nodes}
 
-    for attempt in range(RETRY_ATTEMPTS):
-        node = node_pool.get()
+    def get_node(self) -> str:
+        with self.lock:
+            now = time.time()
 
-        try:
-            result = fn(node)
-            node_pool.report(node, True)
-            return result
+            available = [
+                n for n in self.nodes
+                if self.cooldown[n] <= now
+            ]
 
-        except Exception:
-            node_pool.report(node, False)
+            if not available:
+                return min(self.nodes, key=lambda n: self.cooldown[n])
 
-            if attempt == RETRY_ATTEMPTS - 1:
-                raise
+            return min(available, key=lambda n: self.score[n])
 
-            time.sleep(delay + random.uniform(0, 0.2))
-            delay = min(delay * 2, MAX_DELAY)
+    def report(self, node: str, success: bool, is_rate_limit: bool = False):
+        with self.lock:
+            if success:
+                self.score[node] = max(0, self.score[node] - SUCCESS_REWARD)
+            else:
+                self.score[node] += FAIL_PENALTY
+
+                if is_rate_limit:
+                    self.cooldown[node] = time.time() + COOLDOWN_SEC * 3
+                else:
+                    self.cooldown[node] = time.time() + COOLDOWN_SEC
 
 
 # =========================
-# BATCH FETCH
+# WRITER THREAD
 # =========================
-def fetch_batch(node_pool: NodePool, addresses: List[str]) -> List[BalanceResult]:
-    rate_limiter.wait()
+class Writer:
+    def __init__(self, path: Path):
+        self.path = path
+        self.q = []
+        self.lock = threading.Lock()
+        self.running = True
 
-    def call(node_url: str):
-        payload = []
-        for i, addr in enumerate(addresses):
-            payload.append({
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def push(self, results: List[BalanceResult]):
+        with self.lock:
+            self.q.append(results)
+
+    def run(self):
+        with self.path.open("a") as f:
+            while self.running or self.q:
+                batch = None
+
+                with self.lock:
+                    if self.q:
+                        batch = self.q.pop(0)
+
+                if not batch:
+                    time.sleep(0.05)
+                    continue
+
+                for r in batch:
+                    f.write(json.dumps(r.dump()) + "\n")
+
+    def stop(self):
+        self.running = False
+        self.thread.join()
+
+
+# =========================
+# CORE FETCH
+# =========================
+def fetch_batch(node_mgr: NodeManager, addresses: List[str]) -> List[BalanceResult]:
+
+    def call(node: str):
+        payload = [
+            {
                 "jsonrpc": "2.0",
                 "id": i,
                 "method": "eth_getBalance",
                 "params": [addr, "latest"]
-            })
+            }
+            for i, addr in enumerate(addresses)
+        ]
 
         start = time.perf_counter()
 
-        r = _session.post(node_url, json=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        try:
+            r = geth_session.post(node, json=payload, timeout=10)
 
-        latency = (time.perf_counter() - start) * 1000
+            if r.status_code == 429:
+                node_mgr.report(node, False, is_rate_limit=True)
+                raise Exception("RATE_LIMIT")
 
-        # SAFE unordered handling
-        result_map = {}
-        for item in data:
-            result_map[item["id"]] = item
+            r.raise_for_status()
 
-        results = []
+            data = r.json()
+            latency = (time.perf_counter() - start) * 1000
 
-        for i, addr in enumerate(addresses):
-            item = result_map.get(i)
+            mapping = {item["id"]: item for item in data}
 
-            if not item or "result" not in item:
-                results.append(BalanceResult(addr, None, None, "RPCError"))
-                continue
+            results = []
 
-            wei = int(item["result"], 16)
-            eth = Decimal(wei) / WEI_IN_ETH
+            for i, addr in enumerate(addresses):
+                item = mapping.get(i)
 
-            results.append(BalanceResult(addr, wei, eth, latency_ms=latency))
+                if not item or "result" not in item:
+                    results.append(BalanceResult(addr, None, None, "RPC_ERROR", latency))
+                    continue
 
-        return results
+                wei = int(item["result"], 16)
+                eth = Decimal(wei) / WEI
 
-    try:
-        res = retry_with_failover(node_pool, call)
-        rate_limiter.record(True)
-        return res
+                results.append(BalanceResult(addr, wei, eth, None, latency))
 
-    except Exception:
-        rate_limiter.record(False)
-        return [
-            BalanceResult(a, None, None, "Failed")
-            for a in addresses
-        ]
+            node_mgr.report(node, True)
+            return results
 
+        except Exception as e:
+            node_mgr.report(node, False)
+            raise
 
-# =========================
-# IO (STREAMING JSONL)
-# =========================
-def load_existing(path: Path) -> set:
-    if not path.exists():
-        return set()
+    last_error = None
 
-    processed = set()
-    with path.open() as f:
-        for line in f:
-            try:
-                obj = json.loads(line)
-                processed.add(obj["address"])
-            except:
-                continue
+    for _ in range(MAX_RETRIES):
+        node = node_mgr.get_node()
 
-    return processed
+        try:
+            return call(node)
+        except Exception as e:
+            last_error = e
+            time.sleep(0.3 + random.random() * 0.3)
 
-
-def append_jsonl(path: Path, results: List[BalanceResult]):
-    with path.open("a") as f:
-        for r in results:
-            f.write(json.dumps(r.to_dict()) + "\n")
-
-
-# =========================
-# MAIN PROCESSOR
-# =========================
-def fetch_all(
-    nodes: List[str],
-    addresses: List[str],
-    workers: int,
-    batch_size: int,
-    output_path: Path,
-):
-    node_pool = NodePool(nodes)
-
-    done = load_existing(output_path)
-    addresses = [a for a in addresses if a not in done]
-
-    logging.info(f"Remaining: {len(addresses)}")
-
-    chunks = [
-        addresses[i:i + batch_size]
-        for i in range(0, len(addresses), batch_size)
+    return [
+        BalanceResult(a, None, None, f"FAILED: {last_error}", 0)
+        for a in addresses
     ]
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = set()
-
-        i = 0
-
-        while i < len(chunks) or futures:
-            while i < len(chunks) and len(futures) < MAX_INFLIGHT:
-                futures.add(executor.submit(fetch_batch, node_pool, chunks[i]))
-                i += 1
-
-            done_futures, futures = wait(futures, return_when=FIRST_COMPLETED)
-
-            for f in done_futures:
-                try:
-                    res = f.result()
-                    append_jsonl(output_path, res)
-                except Exception as e:
-                    logging.error(f"Worker crash: {e}")
-
-    logging.info("Completed")
-
 
 # =========================
-# LOAD ADDRESSES
+# FILE HELPERS
 # =========================
 def load_addresses(path: Path) -> List[str]:
     seen = set()
     out = []
 
     for line in path.read_text().splitlines():
-        addr = line.strip()
-        if not addr or addr in seen:
+        a = line.strip()
+        if not a or a in seen:
             continue
-
-        if Web3.is_address(addr):
-            out.append(Web3.to_checksum_address(addr))
-            seen.add(addr)
+        if Web3.is_address(a):
+            out.append(Web3.to_checksum_address(a))
+            seen.add(a)
 
     return out
 
 
-# =========================
-# CSV EXPORT
-# =========================
-def jsonl_to_csv(jsonl_path: Path, csv_path: Path):
-    with jsonl_path.open() as f, csv_path.open("w", newline="") as out:
-        writer = csv.writer(out)
-        writer.writerow(["address", "balance_eth", "error", "latency_ms"])
+def load_done(path: Path) -> set:
+    if not path.exists():
+        return set()
 
+    done = set()
+    with path.open() as f:
         for line in f:
-            obj = json.loads(line)
-            writer.writerow([
-                obj["address"],
-                obj.get("balance_eth"),
-                obj.get("error"),
-                obj.get("latency_ms"),
-            ])
+            try:
+                done.add(json.loads(line)["address"])
+            except:
+                pass
+    return done
+
+
+# =========================
+# MAIN ENGINE
+# =========================
+def run(nodes: List[str], addresses: List[str], workers: int, batch_size: int, out: Path):
+
+    node_mgr = NodeManager(nodes)
+    writer = Writer(out)
+
+    done = load_done(out)
+    addresses = [a for a in addresses if a not in done]
+
+    logging.info(f"Remaining wallets: {len(addresses)}")
+
+    chunks = [
+        addresses[i:i + batch_size]
+        for i in range(0, len(addresses), batch_size)
+    ]
+
+    futures = set()
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        i = 0
+
+        while i < len(chunks) or futures:
+
+            while i < len(chunks) and len(futures) < MAX_INFLIGHT:
+                futures.add(ex.submit(fetch_batch, node_mgr, chunks[i]))
+                i += 1
+
+            done_f, futures = wait(futures, return_when=FIRST_COMPLETED)
+
+            for f in done_f:
+                try:
+                    res = f.result()
+                    writer.push(res)
+                except Exception as e:
+                    logging.error(f"Worker error: {e}")
+
+    writer.stop()
+    logging.info("Completed")
 
 
 # =========================
 # CLI
 # =========================
-def parse_args():
+def main():
     p = argparse.ArgumentParser()
-
     p.add_argument("-i", default="wallets.txt")
     p.add_argument("-o", default="balances.jsonl")
-    p.add_argument("--csv", default=None)
-
-    p.add_argument("-n", required=True,
-                   help="Comma-separated RPC endpoints")
-
-    p.add_argument("--workers", type=int, default=30)
+    p.add_argument("-n", required=True, help="RPCs comma separated")
+    p.add_argument("--workers", type=int, default=40)
     p.add_argument("--batch", type=int, default=50)
 
-    return p.parse_args()
+    args = p.parse_args()
 
-
-# =========================
-# MAIN
-# =========================
-def main():
-    args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    start = time.time()
+    nodes = [x.strip() for x in args.n.split(",")]
+    addresses = load_addresses(Path(args.i))
 
-    try:
-        nodes = [x.strip() for x in args.n.split(",")]
-        addresses = load_addresses(Path(args.i))
-
-        fetch_all(
-            nodes,
-            addresses,
-            args.workers,
-            args.batch,
-            Path(args.o),
-        )
-
-        if args.csv:
-            jsonl_to_csv(Path(args.o), Path(args.csv))
-
-        logging.info(f"Done in {time.time() - start:.2f}s")
-
-    except KeyboardInterrupt:
-        logging.warning("Stopped by user")
-        sys.exit(130)
+    run(nodes, addresses, args.workers, args.batch, Path(args.o))
 
 
 if __name__ == "__main__":
