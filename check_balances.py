@@ -1,97 +1,97 @@
 #!/usr/bin/env python3
 """
-Ethereum Wallet Balance Checker
+Ethereum Wallet Balance Checker v2
 
-High-performance hybrid RPC balance checker.
+Reliable high-throughput Ethereum balance checker using JSON-RPC batch requests.
 
-Features:
-- Multiple RPC nodes support
-- Adaptive node scoring
-- Per-node cooldown and circuit breaker
-- Retry across different nodes
-- Thread-local HTTP sessions
-- Writer thread with queue
-- Streaming JSONL output
-- Fast resume via .done index
-- Progress logging
+Highlights:
+- Multiple RPC endpoints with adaptive scoring and circuit breaking
+- Per-node concurrency limits and latency EWMA
+- Retry on a different RPC endpoint
+- Partial batch recovery for missing / failed RPC items
+- Thread-local HTTP sessions with connection pooling
+- Bounded producer/worker/writer pipeline
+- Streaming JSONL output and durable resume index
+- Graceful Ctrl+C shutdown without losing completed results
+- Input validation, deduplication, optional zero-balance filtering
+- Periodic progress and per-node diagnostics
+
+Python: 3.10+
+Dependencies: requests, web3
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import os
 import queue
 import random
+import signal
 import threading
 import time
-from dataclasses import dataclass, asdict
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 from web3 import Web3
 
-
-# =========================
-# DEFAULT CONFIG
-# =========================
-
 WEI = Decimal("1000000000000000000")
+ETH_QUANT = Decimal("0.000000000000000001")
 
 DEFAULT_BATCH_SIZE = 50
 DEFAULT_WORKERS = 40
-DEFAULT_MAX_INFLIGHT = 200
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_INFLIGHT = 80
+DEFAULT_MAX_RETRIES = 4
+DEFAULT_CONNECT_TIMEOUT = 5.0
+DEFAULT_READ_TIMEOUT = 15.0
+DEFAULT_NODE_CONCURRENCY = 8
 
-DEFAULT_CONNECT_TIMEOUT = 5
-DEFAULT_READ_TIMEOUT = 15
-
-BASE_COOLDOWN_SEC = 2.0
-RATE_LIMIT_COOLDOWN_MULTIPLIER = 5
-MAX_COOLDOWN_SEC = 60
-
-HTTP_POOL_SIZE = 200
-
-PROGRESS_EVERY_SEC = 5
-WRITER_FLUSH_EVERY_LINES = 500
-
-
-# =========================
-# THREAD-LOCAL HTTP SESSION
-# =========================
+BASE_COOLDOWN_SEC = 1.5
+MAX_COOLDOWN_SEC = 90.0
+HTTP_POOL_SIZE = 64
+PROGRESS_EVERY_SEC = 5.0
+WRITER_FLUSH_EVERY_LINES = 250
+WRITER_FLUSH_EVERY_SEC = 2.0
 
 _thread_local = threading.local()
 
 
-def get_session() -> requests.Session:
-    """
-    requests.Session is not guaranteed to be thread-safe.
-    Each worker thread gets its own Session with connection pooling.
-    """
-    session = getattr(_thread_local, "session", None)
+def monotonic() -> float:
+    return time.monotonic()
 
+
+def get_session(user_agent: str) -> requests.Session:
+    session = getattr(_thread_local, "session", None)
     if session is None:
         session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
+        adapter = HTTPAdapter(
             pool_connections=HTTP_POOL_SIZE,
             pool_maxsize=HTTP_POOL_SIZE,
             max_retries=0,
+            pool_block=True,
         )
         session.mount("http://", adapter)
         session.mount("https://", adapter)
+        session.headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": user_agent,
+            }
+        )
         _thread_local.session = session
-
     return session
 
 
-# =========================
-# RESULT MODEL
-# =========================
-
-@dataclass
+@dataclass(slots=True)
 class BalanceResult:
     address: str
     balance_wei: Optional[int]
@@ -99,28 +99,22 @@ class BalanceResult:
     error: Optional[str]
     latency_ms: float
     node: Optional[str] = None
+    attempts: int = 1
 
     @property
     def ok(self) -> bool:
         return self.error is None and self.balance_wei is not None
 
     def dump(self) -> dict:
-        d = asdict(self)
-
+        data = asdict(self)
         if self.balance_eth is not None:
-            # Читаемый ETH без float, чтобы не ловить ошибки округления.
-            d["balance_eth"] = str(
-                self.balance_eth.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+            data["balance_eth"] = str(
+                self.balance_eth.quantize(ETH_QUANT, rounding=ROUND_DOWN)
             )
+        return data
 
-        return d
 
-
-# =========================
-# NODE MANAGER
-# =========================
-
-@dataclass
+@dataclass(slots=True)
 class NodeState:
     score: float = 0.0
     cooldown_until: float = 0.0
@@ -132,713 +126,769 @@ class NodeState:
     ewma_latency_ms: Optional[float] = None
 
 
+class NodeUnavailable(RuntimeError):
+    pass
+
+
+class BatchTransportError(RuntimeError):
+    pass
+
+
 class NodeManager:
-    def __init__(self, nodes: List[str]):
+    def __init__(self, nodes: Sequence[str], per_node_limit: int):
         if not nodes:
             raise ValueError("RPC node list is empty")
+        if per_node_limit < 1:
+            raise ValueError("per_node_limit must be >= 1")
 
-        self.nodes = nodes
-        self.state: Dict[str, NodeState] = {n: NodeState() for n in nodes}
-        self.lock = threading.Lock()
+        self.nodes = list(nodes)
+        self.per_node_limit = per_node_limit
+        self.state: Dict[str, NodeState] = {node: NodeState() for node in self.nodes}
+        self._cv = threading.Condition()
 
-    def acquire_node(self, exclude: Optional[Set[str]] = None) -> str:
-        """
-        Pick best available node.
+    def acquire_node(
+        self,
+        exclude: Optional[Set[str]],
+        stop_event: threading.Event,
+    ) -> str:
+        excluded = exclude or set()
 
-        Lower score is better.
-        Penalizes:
-        - cooldown
-        - recent failures
-        - current inflight
-        - slow latency
-        """
-        exclude = exclude or set()
-
-        while True:
-            with self.lock:
-                now = time.time()
-
-                candidates = [
-                    n for n in self.nodes
-                    if n not in exclude and self.state[n].cooldown_until <= now
+        with self._cv:
+            while not stop_event.is_set():
+                now = monotonic()
+                eligible = [
+                    node
+                    for node in self.nodes
+                    if node not in excluded
+                    and self.state[node].cooldown_until <= now
+                    and self.state[node].inflight < self.per_node_limit
                 ]
 
-                if candidates:
-                    node = min(candidates, key=self._effective_score)
+                if eligible:
+                    node = min(eligible, key=self._effective_score)
                     self.state[node].inflight += 1
                     return node
 
-                # If all non-excluded nodes are cooling down, wait for the soonest one.
-                wait_until = min(
-                    self.state[n].cooldown_until
-                    for n in self.nodes
-                    if n not in exclude
-                ) if any(n not in exclude for n in self.nodes) else now
+                available_pool = [node for node in self.nodes if node not in excluded]
+                if not available_pool:
+                    raise NodeUnavailable("all nodes excluded")
 
-            sleep_for = max(0.05, min(1.0, wait_until - time.time()))
-            time.sleep(sleep_for)
+                wake_in = 0.25
+                cooldowns = [
+                    self.state[node].cooldown_until - now
+                    for node in available_pool
+                    if self.state[node].cooldown_until > now
+                ]
+                if cooldowns:
+                    wake_in = max(0.05, min(0.5, min(cooldowns)))
+                self._cv.wait(timeout=wake_in)
+
+        raise NodeUnavailable("shutdown requested")
 
     def release_node(
         self,
         node: str,
+        *,
         success: bool,
         latency_ms: Optional[float] = None,
         rate_limited: bool = False,
         server_error: bool = False,
     ) -> None:
-        with self.lock:
-            st = self.state[node]
-            st.inflight = max(0, st.inflight - 1)
+        with self._cv:
+            state = self.state[node]
+            state.inflight = max(0, state.inflight - 1)
+
+            if latency_ms is not None:
+                if state.ewma_latency_ms is None:
+                    state.ewma_latency_ms = latency_ms
+                else:
+                    state.ewma_latency_ms = state.ewma_latency_ms * 0.80 + latency_ms * 0.20
 
             if success:
-                st.success_count += 1
-                st.fail_streak = 0
-                st.score = max(0.0, st.score - 1.0)
-
-                if latency_ms is not None:
-                    if st.ewma_latency_ms is None:
-                        st.ewma_latency_ms = latency_ms
-                    else:
-                        st.ewma_latency_ms = st.ewma_latency_ms * 0.8 + latency_ms * 0.2
-
-                return
-
-            st.fail_count += 1
-            st.fail_streak += 1
-
-            if rate_limited:
-                st.rate_limit_count += 1
-                st.score += 8.0
-                cooldown = BASE_COOLDOWN_SEC * RATE_LIMIT_COOLDOWN_MULTIPLIER * st.fail_streak
-            elif server_error:
-                st.score += 4.0
-                cooldown = BASE_COOLDOWN_SEC * min(st.fail_streak, 5)
+                state.success_count += 1
+                state.fail_streak = 0
+                state.score = max(0.0, state.score * 0.92 - 0.25)
             else:
-                st.score += 3.0
-                cooldown = BASE_COOLDOWN_SEC * min(st.fail_streak, 5)
+                state.fail_count += 1
+                state.fail_streak += 1
 
-            cooldown = min(MAX_COOLDOWN_SEC, cooldown)
-            st.cooldown_until = time.time() + cooldown + random.random()
+                if rate_limited:
+                    state.rate_limit_count += 1
+                    state.score += 10.0
+                    cooldown = BASE_COOLDOWN_SEC * (3.0 + state.fail_streak * 2.0)
+                elif server_error:
+                    state.score += 5.0
+                    cooldown = BASE_COOLDOWN_SEC * (2 ** min(state.fail_streak - 1, 5))
+                else:
+                    state.score += 3.0
+                    cooldown = BASE_COOLDOWN_SEC * min(state.fail_streak, 5)
+
+                state.cooldown_until = monotonic() + min(MAX_COOLDOWN_SEC, cooldown) + random.random()
+
+            self._cv.notify_all()
+
+    def wake_all(self) -> None:
+        with self._cv:
+            self._cv.notify_all()
 
     def _effective_score(self, node: str) -> float:
-        st = self.state[node]
-
-        latency_penalty = 0.0
-        if st.ewma_latency_ms is not None:
-            latency_penalty = st.ewma_latency_ms / 1000.0
-
-        return (
-            st.score
-            + st.inflight * 2.0
-            + st.fail_streak * 5.0
-            + latency_penalty
-        )
+        state = self.state[node]
+        latency_penalty = (state.ewma_latency_ms or 0.0) / 750.0
+        utilization_penalty = (state.inflight / self.per_node_limit) * 4.0
+        return state.score + state.fail_streak * 4.0 + latency_penalty + utilization_penalty
 
     def snapshot(self) -> dict:
-        with self.lock:
+        with self._cv:
+            now = monotonic()
             return {
-                self._mask_node(n): {
-                    "score": round(st.score, 2),
-                    "fail_streak": st.fail_streak,
-                    "success": st.success_count,
-                    "fail": st.fail_count,
-                    "429": st.rate_limit_count,
-                    "inflight": st.inflight,
-                    "latency_ms": round(st.ewma_latency_ms, 1) if st.ewma_latency_ms else None,
-                    "cooldown_left": max(0, round(st.cooldown_until - time.time(), 1)),
+                mask_url(node): {
+                    "score": round(state.score, 2),
+                    "fail_streak": state.fail_streak,
+                    "success": state.success_count,
+                    "fail": state.fail_count,
+                    "429": state.rate_limit_count,
+                    "inflight": state.inflight,
+                    "latency_ms": (
+                        round(state.ewma_latency_ms, 1)
+                        if state.ewma_latency_ms is not None
+                        else None
+                    ),
+                    "cooldown_left": max(0.0, round(state.cooldown_until - now, 1)),
                 }
-                for n, st in self.state.items()
+                for node, state in self.state.items()
             }
 
-    @staticmethod
-    def _mask_node(node: str) -> str:
-        # Не светим API keys в логах.
-        if "://" not in node:
-            return node[:20] + "..."
 
-        scheme, rest = node.split("://", 1)
+def mask_url(url: str) -> str:
+    try:
+        parts = urlsplit(url)
+        if not parts.scheme or not parts.netloc:
+            return url[:24] + ("..." if len(url) > 24 else "")
 
-        if "@" in rest:
-            auth, host = rest.rsplit("@", 1)
-            return f"{scheme}://***@{host}"
+        host = parts.hostname or ""
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        netloc = f"***@{host}" if parts.username or parts.password else host
+        path = "/..." if parts.path not in {"", "/"} else parts.path
+        return urlunsplit((parts.scheme, netloc, path, "", ""))
+    except Exception:
+        digest = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:8]
+        return f"rpc:{digest}"
 
-        if "/" in rest:
-            host, path = rest.split("/", 1)
-            return f"{scheme}://{host}/..."
-
-        return f"{scheme}://{rest}"
-
-
-# =========================
-# WRITER THREAD
-# =========================
 
 class Writer:
-    def __init__(self, out_path: Path, done_path: Path):
+    def __init__(
+        self,
+        out_path: Path,
+        done_path: Path,
+        *,
+        queue_size: int,
+        fsync: bool,
+        write_errors: bool,
+        nonzero_only: bool,
+    ):
         self.out_path = out_path
         self.done_path = done_path
+        self.fsync = fsync
+        self.write_errors = write_errors
+        self.nonzero_only = nonzero_only
+        self.q: queue.Queue[Optional[List[BalanceResult]]] = queue.Queue(maxsize=queue_size)
+        self.thread = threading.Thread(target=self._run, name="result-writer", daemon=False)
+        self.error: Optional[BaseException] = None
+        self.written_records = 0
+        self._lock = threading.Lock()
 
-        self.out_path.parent.mkdir(parents=True, exist_ok=True)
-        self.done_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self.q: queue.Queue[Optional[List[BalanceResult]]] = queue.Queue(maxsize=10_000)
-        self.thread = threading.Thread(target=self._run, daemon=True)
-
-        self.written_lines = 0
-        self.lock = threading.Lock()
-
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        done_path.parent.mkdir(parents=True, exist_ok=True)
         self.thread.start()
 
-    def push(self, results: List[BalanceResult]) -> None:
-        self.q.put(results)
+    def push(self, results: List[BalanceResult], stop_event: threading.Event) -> None:
+        while True:
+            self.raise_if_failed()
+            try:
+                self.q.put(results, timeout=0.25)
+                return
+            except queue.Full:
+                if stop_event.is_set() and not self.thread.is_alive():
+                    self.raise_if_failed()
+                    raise RuntimeError("writer stopped unexpectedly")
 
     def stop(self) -> None:
-        self.q.put(None)
-        self.thread.join()
+        if self.thread.is_alive():
+            self.q.put(None)
+            self.thread.join()
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self.error is not None:
+            raise RuntimeError("writer thread failed") from self.error
 
     def _run(self) -> None:
+        try:
+            self._write_loop()
+        except BaseException as exc:
+            self.error = exc
+            logging.exception("Writer thread failed")
+
+    def _write_loop(self) -> None:
         buffered = 0
+        last_flush = monotonic()
 
-        with self.out_path.open("a", encoding="utf-8") as out_f, \
-             self.done_path.open("a", encoding="utf-8") as done_f:
-
+        with self.out_path.open("a", encoding="utf-8", buffering=1024 * 1024) as out_f, self.done_path.open(
+            "a", encoding="utf-8", buffering=1024 * 1024
+        ) as done_f:
             while True:
-                batch = self.q.get()
+                timeout = max(0.1, WRITER_FLUSH_EVERY_SEC - (monotonic() - last_flush))
+                try:
+                    batch = self.q.get(timeout=timeout)
+                except queue.Empty:
+                    batch = []
 
                 if batch is None:
                     break
 
-                for r in batch:
-                    out_f.write(json.dumps(r.dump(), ensure_ascii=False) + "\n")
+                for result in batch:
+                    should_write_output = (
+                        (result.ok and (not self.nonzero_only or (result.balance_wei or 0) > 0))
+                        or (not result.ok and self.write_errors)
+                    )
+                    if should_write_output:
+                        out_f.write(json.dumps(result.dump(), ensure_ascii=False, separators=(",", ":")) + "\n")
 
-                    # В done-индекс пишем только успешные адреса.
-                    # Ошибочные адреса будут повторно обработаны при следующем запуске.
-                    if r.ok:
-                        done_f.write(r.address + "\n")
-
+                    # Mark success as done even when a zero balance is intentionally omitted.
+                    # Output is flushed before the done index, so a crash cannot mark a record
+                    # completed before its result is durable.
+                    if result.ok:
+                        done_f.write(result.address + "\n")
                     buffered += 1
 
-                with self.lock:
-                    self.written_lines += len(batch)
-
-                if buffered >= WRITER_FLUSH_EVERY_LINES:
-                    out_f.flush()
-                    done_f.flush()
+                now = monotonic()
+                if buffered >= WRITER_FLUSH_EVERY_LINES or now - last_flush >= WRITER_FLUSH_EVERY_SEC:
+                    self._flush(out_f, done_f)
                     buffered = 0
+                    last_flush = now
 
-            out_f.flush()
-            done_f.flush()
+                if batch:
+                    with self._lock:
+                        self.written_records += len(batch)
 
+            self._flush(out_f, done_f)
 
-# =========================
-# STATS
-# =========================
+    def _flush(self, out_f, done_f) -> None:
+        out_f.flush()
+        if self.fsync:
+            os.fsync(out_f.fileno())
+        done_f.flush()
+        if self.fsync:
+            os.fsync(done_f.fileno())
+
 
 class Stats:
     def __init__(self, total: int):
         self.total = total
         self.ok = 0
         self.errors = 0
-        self.lock = threading.Lock()
-        self.started_at = time.perf_counter()
+        self._lock = threading.Lock()
+        self.started_at = monotonic()
 
-    def add(self, results: List[BalanceResult]) -> None:
-        with self.lock:
-            for r in results:
-                if r.ok:
-                    self.ok += 1
-                else:
-                    self.errors += 1
+    def add(self, results: Sequence[BalanceResult]) -> None:
+        ok = sum(1 for result in results if result.ok)
+        with self._lock:
+            self.ok += ok
+            self.errors += len(results) - ok
 
-    def snapshot(self) -> Tuple[int, int, int, float]:
-        with self.lock:
+    def snapshot(self) -> Tuple[int, int, int, float, Optional[float]]:
+        with self._lock:
             done = self.ok + self.errors
-            elapsed = max(0.001, time.perf_counter() - self.started_at)
+            elapsed = max(0.001, monotonic() - self.started_at)
             speed = done / elapsed
-            return done, self.ok, self.errors, speed
+            eta = (self.total - done) / speed if speed > 0 else None
+            return done, self.ok, self.errors, speed, eta
 
 
-# =========================
-# CORE RPC
-# =========================
+def parse_rpc_item(item: object, address: str) -> BalanceResult:
+    if not isinstance(item, dict):
+        return BalanceResult(address, None, None, "INVALID_RPC_ITEM", 0.0)
 
-class BatchTransportError(Exception):
-    pass
+    if "error" in item:
+        error = item.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = str(error.get("message", "RPC_ERROR"))[:300]
+            return BalanceResult(address, None, None, f"RPC_ERROR[{code}]: {message}", 0.0)
+        return BalanceResult(address, None, None, f"RPC_ERROR: {str(error)[:300]}", 0.0)
+
+    raw = item.get("result")
+    if not isinstance(raw, str) or not raw.startswith("0x"):
+        return BalanceResult(address, None, None, "BAD_RPC_RESULT", 0.0)
+
+    try:
+        wei = int(raw, 16)
+    except ValueError:
+        return BalanceResult(address, None, None, f"BAD_HEX_BALANCE: {raw[:80]}", 0.0)
+
+    return BalanceResult(address, wei, Decimal(wei) / WEI, None, 0.0)
+
+
+def call_rpc_batch(
+    node: str,
+    addresses: Sequence[str],
+    timeout: Tuple[float, float],
+    user_agent: str,
+) -> List[BalanceResult]:
+    payload = [
+        {
+            "jsonrpc": "2.0",
+            "id": index,
+            "method": "eth_getBalance",
+            "params": [address, "latest"],
+        }
+        for index, address in enumerate(addresses)
+    ]
+
+    response = get_session(user_agent).post(node, json=payload, timeout=timeout)
+    response.raise_for_status()
+
+    try:
+        data = response.json()
+    except (ValueError, json.JSONDecodeError) as exc:
+        snippet = response.text[:200].replace("\n", " ")
+        raise BatchTransportError(f"BAD_JSON: {snippet}") from exc
+
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            raise BatchTransportError(
+                f"RPC_BATCH_ERROR[{error.get('code')}]: {str(error.get('message', ''))[:200]}"
+            )
+        raise BatchTransportError("UNEXPECTED_JSON_OBJECT")
+    if not isinstance(data, list):
+        raise BatchTransportError("UNEXPECTED_JSON_TYPE")
+
+    mapping: Dict[int, object] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        if isinstance(item_id, int) and 0 <= item_id < len(addresses):
+            mapping[item_id] = item
+
+    return [
+        parse_rpc_item(mapping.get(index), address)
+        if index in mapping
+        else BalanceResult(address, None, None, "MISSING_RPC_RESPONSE", 0.0)
+        for index, address in enumerate(addresses)
+    ]
 
 
 def fetch_batch(
     node_mgr: NodeManager,
     addresses: List[str],
     max_retries: int,
-    timeout: Tuple[int, int],
+    timeout: Tuple[float, float],
+    stop_event: threading.Event,
+    user_agent: str,
 ) -> List[BalanceResult]:
-
-    last_error: Optional[str] = None
+    pending = list(addresses)
+    completed: Dict[str, BalanceResult] = {}
     tried_nodes: Set[str] = set()
+    last_error = "UNKNOWN"
 
     for attempt in range(1, max_retries + 1):
-        # Сначала пробуем разные RPC. Если все уже пробовали — разрешаем повтор.
+        if not pending or stop_event.is_set():
+            break
         if len(tried_nodes) >= len(node_mgr.nodes):
             tried_nodes.clear()
 
-        node = node_mgr.acquire_node(exclude=tried_nodes)
-        tried_nodes.add(node)
+        try:
+            node = node_mgr.acquire_node(tried_nodes, stop_event)
+        except NodeUnavailable as exc:
+            last_error = str(exc)
+            break
 
-        start = time.perf_counter()
+        tried_nodes.add(node)
+        started = monotonic()
+        node_ok = False
+        rate_limited = False
+        server_error = False
 
         try:
-            results = call_rpc_batch(node, addresses, timeout)
-            latency_ms = (time.perf_counter() - start) * 1000
+            results = call_rpc_batch(node, pending, timeout, user_agent)
+            latency_ms = (monotonic() - started) * 1000.0
 
-            node_mgr.release_node(node, success=True, latency_ms=latency_ms)
+            retry_addresses: List[str] = []
+            for result in results:
+                result.latency_ms = latency_ms
+                result.node = mask_url(node)
+                result.attempts = attempt
+                if result.ok:
+                    completed[result.address] = result
+                else:
+                    retry_addresses.append(result.address)
+                    last_error = result.error or "RPC_ITEM_ERROR"
 
-            for r in results:
-                r.node = NodeManager._mask_node(node)
-                r.latency_ms = latency_ms
+            # The transport worked. A node with partial item errors is only mildly penalized
+            # by retrying those items elsewhere; it is not circuit-broken as a dead endpoint.
+            node_ok = True
+            pending = retry_addresses
 
-            return results
-
-        except requests.HTTPError as e:
-            latency_ms = (time.perf_counter() - start) * 1000
-            status_code = e.response.status_code if e.response is not None else None
-
-            is_rate_limit = status_code == 429
-            is_server_error = status_code in {500, 502, 503, 504}
-
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            rate_limited = status == 429
+            server_error = status is not None and 500 <= status <= 599
+            last_error = f"HTTP_{status}" if status else "HTTP_ERROR"
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            server_error = True
+            last_error = type(exc).__name__
+        except BatchTransportError as exc:
+            last_error = str(exc)[:300]
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+        finally:
+            latency_ms = (monotonic() - started) * 1000.0
             node_mgr.release_node(
                 node,
-                success=False,
+                success=node_ok,
                 latency_ms=latency_ms,
-                rate_limited=is_rate_limit,
-                server_error=is_server_error,
+                rate_limited=rate_limited,
+                server_error=server_error,
             )
 
-            last_error = f"HTTP_{status_code}"
+        if pending and attempt < max_retries and not stop_event.is_set():
+            stop_event.wait(min(3.0, 0.15 * (2 ** (attempt - 1)) + random.uniform(0.05, 0.35)))
 
-        except (requests.Timeout, requests.ConnectionError) as e:
-            latency_ms = (time.perf_counter() - start) * 1000
-
-            node_mgr.release_node(
-                node,
-                success=False,
-                latency_ms=latency_ms,
-                server_error=True,
-            )
-
-            last_error = type(e).__name__
-
-        except Exception as e:
-            latency_ms = (time.perf_counter() - start) * 1000
-
-            node_mgr.release_node(
-                node,
-                success=False,
-                latency_ms=latency_ms,
-                server_error=False,
-            )
-
-            last_error = str(e)[:200]
-
-        # Небольшой backoff между ретраями.
-        time.sleep(min(2.0, 0.2 * attempt + random.random() * 0.3))
-
-    return [
-        BalanceResult(
-            address=a,
+    for address in pending:
+        completed[address] = BalanceResult(
+            address=address,
             balance_wei=None,
             balance_eth=None,
-            error=f"FAILED: {last_error}",
+            error=f"FAILED_AFTER_{max_retries}_ATTEMPTS: {last_error}",
             latency_ms=0.0,
             node=None,
-        )
-        for a in addresses
-    ]
-
-
-def call_rpc_batch(
-    node: str,
-    addresses: List[str],
-    timeout: Tuple[int, int],
-) -> List[BalanceResult]:
-    payload = [
-        {
-            "jsonrpc": "2.0",
-            "id": i,
-            "method": "eth_getBalance",
-            "params": [addr, "latest"],
-        }
-        for i, addr in enumerate(addresses)
-    ]
-
-    session = get_session()
-    response = session.post(node, json=payload, timeout=timeout)
-
-    if response.status_code == 429:
-        raise requests.HTTPError("HTTP 429", response=response)
-
-    if response.status_code in {500, 502, 503, 504}:
-        raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
-
-    response.raise_for_status()
-
-    try:
-        data = response.json()
-    except Exception as e:
-        raise BatchTransportError(f"BAD_JSON: {e}") from e
-
-    if isinstance(data, dict):
-        # Некоторые RPC могут вернуть одиночную ошибку на batch request.
-        if "error" in data:
-            msg = data["error"].get("message", "RPC_ERROR")
-            raise BatchTransportError(f"RPC_BATCH_ERROR: {msg}")
-
-        raise BatchTransportError("UNEXPECTED_JSON_OBJECT")
-
-    if not isinstance(data, list):
-        raise BatchTransportError("UNEXPECTED_JSON_TYPE")
-
-    mapping = {}
-    for item in data:
-        if isinstance(item, dict) and "id" in item:
-            mapping[item["id"]] = item
-
-    results: List[BalanceResult] = []
-
-    for i, addr in enumerate(addresses):
-        item = mapping.get(i)
-
-        if not item:
-            results.append(
-                BalanceResult(
-                    address=addr,
-                    balance_wei=None,
-                    balance_eth=None,
-                    error="MISSING_RPC_RESPONSE",
-                    latency_ms=0.0,
-                )
-            )
-            continue
-
-        if "error" in item:
-            err = item.get("error") or {}
-            msg = err.get("message") if isinstance(err, dict) else str(err)
-
-            results.append(
-                BalanceResult(
-                    address=addr,
-                    balance_wei=None,
-                    balance_eth=None,
-                    error=f"RPC_ERROR: {msg}",
-                    latency_ms=0.0,
-                )
-            )
-            continue
-
-        raw_balance = item.get("result")
-
-        if not isinstance(raw_balance, str):
-            results.append(
-                BalanceResult(
-                    address=addr,
-                    balance_wei=None,
-                    balance_eth=None,
-                    error="BAD_RPC_RESULT",
-                    latency_ms=0.0,
-                )
-            )
-            continue
-
-        try:
-            wei = int(raw_balance, 16)
-        except ValueError:
-            results.append(
-                BalanceResult(
-                    address=addr,
-                    balance_wei=None,
-                    balance_eth=None,
-                    error=f"BAD_HEX_BALANCE: {raw_balance}",
-                    latency_ms=0.0,
-                )
-            )
-            continue
-
-        eth = Decimal(wei) / WEI
-
-        results.append(
-            BalanceResult(
-                address=addr,
-                balance_wei=wei,
-                balance_eth=eth,
-                error=None,
-                latency_ms=0.0,
-            )
+            attempts=max_retries,
         )
 
-    return results
+    # Preserve original input order.
+    return [completed[address] for address in addresses if address in completed]
 
 
-# =========================
-# FILE HELPERS
-# =========================
+def iter_input_addresses(path: Path) -> Iterator[str]:
+    with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            candidate = raw.split(",", 1)[0].split(";", 1)[0].strip()
+            if not Web3.is_address(candidate):
+                logging.debug("Skipping invalid address at line %d: %r", line_number, candidate)
+                continue
+            yield Web3.to_checksum_address(candidate)
+
 
 def load_addresses(path: Path) -> List[str]:
     seen: Set[str] = set()
-    out: List[str] = []
-
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            raw = line.strip()
-
-            if not raw:
-                continue
-
-            # Позволяет использовать файлы вида:
-            # address
-            # address,comment
-            # address;comment
-            candidate = raw.split(",")[0].split(";")[0].strip()
-
-            if not Web3.is_address(candidate):
-                continue
-
-            checksum = Web3.to_checksum_address(candidate)
-
-            if checksum in seen:
-                continue
-
-            seen.add(checksum)
-            out.append(checksum)
-
-    return out
+    addresses: List[str] = []
+    for address in iter_input_addresses(path):
+        if address not in seen:
+            seen.add(address)
+            addresses.append(address)
+    return addresses
 
 
 def load_done(out_path: Path, done_path: Path) -> Set[str]:
-    """
-    Fast resume priority:
-    1. .done index
-    2. fallback scan of JSONL output
-
-    Only successful records are considered done.
-    """
     done: Set[str] = set()
-
-    if done_path.exists():
-        with done_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                addr = line.strip()
-                if Web3.is_address(addr):
-                    done.add(Web3.to_checksum_address(addr))
-
+    source = done_path if done_path.exists() else out_path
+    if not source.exists():
         return done
 
-    if not out_path.exists():
-        return done
-
-    with out_path.open("r", encoding="utf-8") as f:
-        for line in f:
+    with source.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
             try:
-                obj = json.loads(line)
-                addr = obj.get("address")
-                err = obj.get("error")
-
-                if addr and err is None and Web3.is_address(addr):
-                    done.add(Web3.to_checksum_address(addr))
-            except Exception:
+                if source == done_path:
+                    address = line.strip()
+                    success = True
+                else:
+                    obj = json.loads(line)
+                    address = obj.get("address")
+                    success = obj.get("error") is None
+                if success and address and Web3.is_address(address):
+                    done.add(Web3.to_checksum_address(address))
+            except (ValueError, TypeError, json.JSONDecodeError):
                 continue
-
     return done
 
 
 def parse_nodes(raw: str) -> List[str]:
-    nodes = []
-
-    for item in raw.split(","):
+    nodes: List[str] = []
+    for item in raw.replace("\n", ",").split(","):
         node = item.strip()
         if not node:
             continue
+        parts = urlsplit(node)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            raise ValueError(f"Invalid RPC URL: {mask_url(node)}")
         nodes.append(node)
-
-    # Дедупликация с сохранением порядка.
     return list(dict.fromkeys(nodes))
 
 
-def chunks_of(items: List[str], size: int) -> Iterable[List[str]]:
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+def batched(items: Sequence[str], size: int) -> Iterator[List[str]]:
+    for start in range(0, len(items), size):
+        yield list(items[start : start + size])
 
 
-# =========================
-# MAIN ENGINE
-# =========================
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or seconds < 0:
+        return "?"
+    seconds_i = int(seconds)
+    hours, rem = divmod(seconds_i, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def validate_args(args: argparse.Namespace, node_count: int) -> None:
+    if args.workers < 1:
+        raise SystemExit("--workers must be >= 1")
+    if args.batch < 1:
+        raise SystemExit("--batch must be >= 1")
+    if args.max_inflight < 1:
+        raise SystemExit("--max-inflight must be >= 1")
+    if args.retries < 1:
+        raise SystemExit("--retries must be >= 1")
+    if args.node_concurrency < 1:
+        raise SystemExit("--node-concurrency must be >= 1")
+    if args.connect_timeout <= 0 or args.read_timeout <= 0:
+        raise SystemExit("timeouts must be > 0")
+    if args.max_inflight < args.workers:
+        logging.warning("--max-inflight is below --workers; effective parallelism will be limited")
+    theoretical = node_count * args.node_concurrency
+    if args.workers > theoretical:
+        logging.warning(
+            "workers=%d exceeds total per-node capacity=%d; extra threads may mostly wait",
+            args.workers,
+            theoretical,
+        )
+
 
 def run(
+    *,
     nodes: List[str],
     addresses: List[str],
     workers: int,
     batch_size: int,
     max_inflight: int,
     max_retries: int,
+    node_concurrency: int,
     out_path: Path,
     done_path: Path,
-    timeout: Tuple[int, int],
-) -> None:
-    node_mgr = NodeManager(nodes)
+    timeout: Tuple[float, float],
+    fsync: bool,
+    write_errors: bool,
+    nonzero_only: bool,
+    user_agent: str,
+) -> int:
+    stop_event = threading.Event()
+    node_mgr = NodeManager(nodes, per_node_limit=node_concurrency)
 
-    done = load_done(out_path, done_path)
-    addresses = [a for a in addresses if a not in done]
-
-    total = len(addresses)
+    already_done = load_done(out_path, done_path)
+    remaining = [address for address in addresses if address not in already_done]
+    total = len(remaining)
     stats = Stats(total)
-    writer = Writer(out_path, done_path)
+    writer = Writer(
+        out_path,
+        done_path,
+        queue_size=max(16, max_inflight * 2),
+        fsync=fsync,
+        write_errors=write_errors,
+        nonzero_only=nonzero_only,
+    )
 
-    logging.info("RPC nodes: %s", len(nodes))
-    logging.info("Already done: %s", len(done))
-    logging.info("Remaining wallets: %s", total)
-    logging.info("Workers: %s | batch: %s | max_inflight: %s", workers, batch_size, max_inflight)
+    logging.info("RPC nodes: %d", len(nodes))
+    logging.info("Input unique wallets: %d | already done: %d | remaining: %d", len(addresses), len(already_done), total)
+    logging.info(
+        "Workers: %d | batch: %d | max_inflight: %d | per-node limit: %d",
+        workers,
+        batch_size,
+        max_inflight,
+        node_concurrency,
+    )
 
     if total == 0:
         writer.stop()
         logging.info("Nothing to do")
-        return
+        return 0
 
-    chunks = list(chunks_of(addresses, batch_size))
-    futures = set()
+    def request_stop(signum=None, frame=None) -> None:  # noqa: ARG001
+        if not stop_event.is_set():
+            logging.warning("Shutdown requested; no new batches will be submitted")
+            stop_event.set()
+            node_mgr.wake_all()
 
-    last_progress_log = time.perf_counter()
+    previous_sigint = signal.signal(signal.SIGINT, request_stop)
+    previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+
+    batches = iter(batched(remaining, batch_size))
+    futures: Set[Future[List[BalanceResult]]] = set()
+    exhausted = False
+    last_progress = monotonic()
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rpc")
 
     try:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            i = 0
-
-            while i < len(chunks) or futures:
-                while i < len(chunks) and len(futures) < max_inflight:
-                    futures.add(
-                        ex.submit(
-                            fetch_batch,
-                            node_mgr,
-                            chunks[i],
-                            max_retries,
-                            timeout,
-                        )
+        while (not exhausted and not stop_event.is_set()) or futures:
+            while not exhausted and not stop_event.is_set() and len(futures) < max_inflight:
+                try:
+                    batch = next(batches)
+                except StopIteration:
+                    exhausted = True
+                    break
+                futures.add(
+                    executor.submit(
+                        fetch_batch,
+                        node_mgr,
+                        batch,
+                        max_retries,
+                        timeout,
+                        stop_event,
+                        user_agent,
                     )
-                    i += 1
+                )
 
-                done_futures, futures = wait(futures, return_when=FIRST_COMPLETED)
+            if not futures:
+                break
 
-                for f in done_futures:
-                    try:
-                        results = f.result()
-                    except Exception as e:
-                        logging.exception("Unexpected worker error: %s", e)
-                        continue
+            completed, futures = wait(futures, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in completed:
+                try:
+                    results = future.result()
+                except Exception:
+                    logging.exception("Unexpected worker failure")
+                    stop_event.set()
+                    node_mgr.wake_all()
+                    continue
+                stats.add(results)
+                writer.push(results, stop_event)
 
-                    stats.add(results)
-                    writer.push(results)
-
-                now = time.perf_counter()
-                if now - last_progress_log >= PROGRESS_EVERY_SEC:
-                    done_count, ok_count, err_count, speed = stats.snapshot()
-                    remaining = max(0, total - done_count)
-
-                    logging.info(
-                        "Progress: %s/%s | ok=%s | err=%s | remaining=%s | %.1f wallets/sec",
-                        done_count,
-                        total,
-                        ok_count,
-                        err_count,
-                        remaining,
-                        speed,
-                    )
-
-                    last_progress_log = now
-
-    except KeyboardInterrupt:
-        logging.warning("Interrupted by user. Already written results are saved.")
+            writer.raise_if_failed()
+            now = monotonic()
+            if now - last_progress >= PROGRESS_EVERY_SEC:
+                done, ok, errors, speed, eta = stats.snapshot()
+                logging.info(
+                    "Progress: %d/%d | ok=%d | err=%d | %.1f wallets/s | ETA %s",
+                    done,
+                    total,
+                    ok,
+                    errors,
+                    speed,
+                    format_duration(eta),
+                )
+                logging.debug("Node stats: %s", json.dumps(node_mgr.snapshot(), ensure_ascii=False))
+                last_progress = now
 
     finally:
+        stop_event.set()
+        node_mgr.wake_all()
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
         writer.stop()
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
-    done_count, ok_count, err_count, speed = stats.snapshot()
-
+    done, ok, errors, speed, _ = stats.snapshot()
     logging.info(
-        "Completed: %s/%s | ok=%s | err=%s | avg_speed=%.1f wallets/sec",
-        done_count,
+        "Finished: %d/%d | ok=%d | err=%d | average %.1f wallets/s",
+        done,
         total,
-        ok_count,
-        err_count,
+        ok,
+        errors,
         speed,
     )
-
     logging.info("Node stats: %s", json.dumps(node_mgr.snapshot(), ensure_ascii=False))
 
+    if stop_event.is_set() and done < total:
+        logging.warning("Stopped early. Resume by running the same command again.")
+        return 130
+    return 1 if errors else 0
 
-# =========================
-# CLI
-# =========================
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Ethereum wallet balance checker with multi-RPC batching and resume"
+        description="Ethereum wallet balance checker with multi-RPC batching and durable resume",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    parser.add_argument("-i", "--input", default="wallets.txt", help="Input wallets file")
+    parser.add_argument("-i", "--input", default="wallets.txt", help="Input wallet file")
     parser.add_argument("-o", "--output", default="balances.jsonl", help="Output JSONL file")
-    parser.add_argument("-n", "--nodes", required=True, help="RPC URLs comma separated")
-
+    parser.add_argument(
+        "-n",
+        "--nodes",
+        default=os.getenv("RPC_URLS", ""),
+        help="Comma/newline-separated RPC URLs; defaults to RPC_URLS env var",
+    )
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-inflight", type=int, default=DEFAULT_MAX_INFLIGHT)
     parser.add_argument("--retries", type=int, default=DEFAULT_MAX_RETRIES)
-
-    parser.add_argument("--connect-timeout", type=int, default=DEFAULT_CONNECT_TIMEOUT)
-    parser.add_argument("--read-timeout", type=int, default=DEFAULT_READ_TIMEOUT)
-
-    parser.add_argument(
-        "--done-index",
-        default=None,
-        help="Optional done index path. Default: output + '.done'",
-    )
-
+    parser.add_argument("--node-concurrency", type=int, default=DEFAULT_NODE_CONCURRENCY)
+    parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT)
+    parser.add_argument("--read-timeout", type=float, default=DEFAULT_READ_TIMEOUT)
+    parser.add_argument("--done-index", default=None, help="Resume index; default is OUTPUT.done")
+    parser.add_argument("--fsync", action="store_true", help="fsync output/index after each writer flush")
+    parser.add_argument("--no-error-output", action="store_true", help="Do not write failed records to JSONL")
+    parser.add_argument("--nonzero-only", action="store_true", help="Write only successful non-zero balances")
+    parser.add_argument("--user-agent", default="eth-balance-checker/2.0")
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    return parser
 
-    args = parser.parse_args()
 
+def main() -> int:
+    args = build_parser().parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level),
-        format="%(asctime)s | %(levelname)s | %(message)s",
+        format="%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
     )
 
-    nodes = parse_nodes(args.nodes)
-
+    try:
+        nodes = parse_nodes(args.nodes)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not nodes:
-        raise SystemExit("No RPC nodes provided")
+        raise SystemExit("No RPC nodes provided. Use --nodes or RPC_URLS.")
+
+    validate_args(args, len(nodes))
 
     input_path = Path(args.input)
     output_path = Path(args.output)
+    done_path = Path(args.done_index) if args.done_index else Path(f"{output_path}.done")
 
-    done_path = Path(args.done_index) if args.done_index else Path(str(output_path) + ".done")
+    if not input_path.is_file():
+        raise SystemExit(f"Input file not found: {input_path}")
+    if output_path.resolve() == done_path.resolve():
+        raise SystemExit("Output file and done index must be different files")
 
     addresses = load_addresses(input_path)
-
     if not addresses:
         raise SystemExit("No valid Ethereum addresses found")
 
-    run(
+    return run(
         nodes=nodes,
         addresses=addresses,
         workers=args.workers,
         batch_size=args.batch,
         max_inflight=args.max_inflight,
         max_retries=args.retries,
+        node_concurrency=args.node_concurrency,
         out_path=output_path,
         done_path=done_path,
         timeout=(args.connect_timeout, args.read_timeout),
+        fsync=args.fsync,
+        write_errors=not args.no_error_output,
+        nonzero_only=args.nonzero_only,
+        user_agent=args.user_agent,
     )
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
