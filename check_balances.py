@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ethereum Wallet Balance Checker v2
+Ethereum Wallet Balance Checker v3
 
 Reliable high-throughput Ethereum balance checker using JSON-RPC batch requests.
 
@@ -36,7 +36,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -69,7 +69,14 @@ def monotonic() -> float:
 
 
 def get_session(user_agent: str) -> requests.Session:
-    session = getattr(_thread_local, "session", None)
+    # Keep one pooled session per thread and User-Agent. This avoids silently
+    # reusing stale headers when the checker is embedded and called repeatedly.
+    sessions = getattr(_thread_local, "sessions", None)
+    if sessions is None:
+        sessions = {}
+        _thread_local.sessions = sessions
+
+    session = sessions.get(user_agent)
     if session is None:
         session = requests.Session()
         adapter = HTTPAdapter(
@@ -87,7 +94,7 @@ def get_session(user_agent: str) -> requests.Session:
                 "User-Agent": user_agent,
             }
         )
-        _thread_local.session = session
+        sessions[user_agent] = session
     return session
 
 
@@ -131,7 +138,18 @@ class NodeUnavailable(RuntimeError):
 
 
 class BatchTransportError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        rate_limited: bool = False,
+        server_error: bool = False,
+        retry_after: Optional[float] = None,
+    ) -> None:
+        super().__init__(message)
+        self.rate_limited = rate_limited
+        self.server_error = server_error
+        self.retry_after = retry_after
 
 
 class NodeManager:
@@ -193,6 +211,7 @@ class NodeManager:
         latency_ms: Optional[float] = None,
         rate_limited: bool = False,
         server_error: bool = False,
+        cooldown_hint: Optional[float] = None,
     ) -> None:
         with self._cv:
             state = self.state[node]
@@ -223,6 +242,8 @@ class NodeManager:
                     state.score += 3.0
                     cooldown = BASE_COOLDOWN_SEC * min(state.fail_streak, 5)
 
+                if cooldown_hint is not None:
+                    cooldown = max(cooldown, cooldown_hint)
                 state.cooldown_until = monotonic() + min(MAX_COOLDOWN_SEC, cooldown) + random.random()
 
             self._cv.notify_all()
@@ -314,8 +335,15 @@ class Writer:
                     raise RuntimeError("writer stopped unexpectedly")
 
     def stop(self) -> None:
+        # Never block forever trying to enqueue the sentinel after a writer crash.
+        while self.thread.is_alive():
+            self.raise_if_failed()
+            try:
+                self.q.put(None, timeout=0.25)
+                break
+            except queue.Full:
+                continue
         if self.thread.is_alive():
-            self.q.put(None)
             self.thread.join()
         self.raise_if_failed()
 
@@ -430,24 +458,43 @@ def parse_rpc_item(item: object, address: str) -> BalanceResult:
     return BalanceResult(address, wei, Decimal(wei) / WEI, None, 0.0)
 
 
-def call_rpc_batch(
+def _retry_after_seconds(response: requests.Response) -> Optional[float]:
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
+def _call_rpc_batch_once(
     node: str,
     addresses: Sequence[str],
     timeout: Tuple[float, float],
     user_agent: str,
+    block_tag: str,
 ) -> List[BalanceResult]:
     payload = [
         {
             "jsonrpc": "2.0",
             "id": index,
             "method": "eth_getBalance",
-            "params": [address, "latest"],
+            "params": [address, block_tag],
         }
         for index, address in enumerate(addresses)
     ]
 
     response = get_session(user_agent).post(node, json=payload, timeout=timeout)
-    response.raise_for_status()
+    status = response.status_code
+    if status >= 400:
+        snippet = response.text[:240].replace("\n", " ")
+        raise BatchTransportError(
+            f"HTTP_{status}: {snippet}",
+            rate_limited=status == 429,
+            server_error=500 <= status <= 599,
+            retry_after=_retry_after_seconds(response),
+        )
 
     try:
         data = response.json()
@@ -481,6 +528,36 @@ def call_rpc_batch(
     ]
 
 
+def call_rpc_batch(
+    node: str,
+    addresses: Sequence[str],
+    timeout: Tuple[float, float],
+    user_agent: str,
+    block_tag: str,
+) -> List[BalanceResult]:
+    try:
+        return _call_rpc_batch_once(node, addresses, timeout, user_agent, block_tag)
+    except BatchTransportError as exc:
+        text = str(exc).lower()
+        split_candidate = (
+            len(addresses) > 1
+            and (
+                "http_413" in text
+                or "payload too large" in text
+                or "request entity too large" in text
+                or "batch limit" in text
+                or "too many requests in batch" in text
+            )
+        )
+        if not split_candidate:
+            raise
+
+        middle = len(addresses) // 2
+        left = call_rpc_batch(node, addresses[:middle], timeout, user_agent, block_tag)
+        right = call_rpc_batch(node, addresses[middle:], timeout, user_agent, block_tag)
+        return left + right
+
+
 def fetch_batch(
     node_mgr: NodeManager,
     addresses: List[str],
@@ -488,6 +565,7 @@ def fetch_batch(
     timeout: Tuple[float, float],
     stop_event: threading.Event,
     user_agent: str,
+    block_tag: str,
 ) -> List[BalanceResult]:
     pending = list(addresses)
     completed: Dict[str, BalanceResult] = {}
@@ -511,9 +589,10 @@ def fetch_batch(
         node_ok = False
         rate_limited = False
         server_error = False
+        cooldown_hint: Optional[float] = None
 
         try:
-            results = call_rpc_batch(node, pending, timeout, user_agent)
+            results = call_rpc_batch(node, pending, timeout, user_agent, block_tag)
             latency_ms = (monotonic() - started) * 1000.0
 
             retry_addresses: List[str] = []
@@ -541,6 +620,9 @@ def fetch_batch(
             server_error = True
             last_error = type(exc).__name__
         except BatchTransportError as exc:
+            rate_limited = exc.rate_limited
+            server_error = exc.server_error
+            cooldown_hint = exc.retry_after
             last_error = str(exc)[:300]
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {str(exc)[:240]}"
@@ -552,6 +634,7 @@ def fetch_batch(
                 latency_ms=latency_ms,
                 rate_limited=rate_limited,
                 server_error=server_error,
+                cooldown_hint=cooldown_hint,
             )
 
         if pending and attempt < max_retries and not stop_event.is_set():
@@ -596,25 +679,27 @@ def load_addresses(path: Path) -> List[str]:
 
 
 def load_done(out_path: Path, done_path: Path) -> Set[str]:
+    # Read both sources. If a crash happened after flushing JSONL but before
+    # flushing the index, the JSONL record still prevents duplicate output.
     done: Set[str] = set()
-    source = done_path if done_path.exists() else out_path
-    if not source.exists():
-        return done
 
-    with source.open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            try:
-                if source == done_path:
-                    address = line.strip()
-                    success = True
-                else:
+    if done_path.exists():
+        with done_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                address = line.strip()
+                if address and Web3.is_address(address):
+                    done.add(Web3.to_checksum_address(address))
+
+    if out_path.exists():
+        with out_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
                     obj = json.loads(line)
                     address = obj.get("address")
-                    success = obj.get("error") is None
-                if success and address and Web3.is_address(address):
-                    done.add(Web3.to_checksum_address(address))
-            except (ValueError, TypeError, json.JSONDecodeError):
-                continue
+                    if obj.get("error") is None and address and Web3.is_address(address):
+                        done.add(Web3.to_checksum_address(address))
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
     return done
 
 
@@ -685,6 +770,7 @@ def run(
     write_errors: bool,
     nonzero_only: bool,
     user_agent: str,
+    block_tag: str,
 ) -> int:
     stop_event = threading.Event()
     node_mgr = NodeManager(nodes, per_node_limit=node_concurrency)
@@ -749,6 +835,7 @@ def run(
                         timeout,
                         stop_event,
                         user_agent,
+                        block_tag,
                     )
                 )
 
@@ -834,7 +921,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fsync", action="store_true", help="fsync output/index after each writer flush")
     parser.add_argument("--no-error-output", action="store_true", help="Do not write failed records to JSONL")
     parser.add_argument("--nonzero-only", action="store_true", help="Write only successful non-zero balances")
-    parser.add_argument("--user-agent", default="eth-balance-checker/2.0")
+    parser.add_argument(
+        "--block-tag",
+        default="latest",
+        choices=["latest", "safe", "finalized", "pending"],
+        help="Block tag used by eth_getBalance",
+    )
+    parser.add_argument("--user-agent", default="eth-balance-checker/3.0")
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -865,8 +958,13 @@ def main() -> int:
 
     if not input_path.is_file():
         raise SystemExit(f"Input file not found: {input_path}")
-    if output_path.resolve() == done_path.resolve():
+    resolved_input = input_path.resolve()
+    resolved_output = output_path.resolve()
+    resolved_done = done_path.resolve()
+    if resolved_output == resolved_done:
         raise SystemExit("Output file and done index must be different files")
+    if resolved_input in {resolved_output, resolved_done}:
+        raise SystemExit("Input, output, and done index must be different files")
 
     addresses = load_addresses(input_path)
     if not addresses:
@@ -887,6 +985,7 @@ def main() -> int:
         write_errors=not args.no_error_output,
         nonzero_only=args.nonzero_only,
         user_agent=args.user_agent,
+        block_tag=args.block_tag,
     )
 
 
