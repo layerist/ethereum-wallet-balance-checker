@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ethereum Wallet Balance Checker v3
+Ethereum Wallet Balance Checker v4
 
 Reliable high-throughput Ethereum balance checker using JSON-RPC batch requests.
 
@@ -12,7 +12,9 @@ Highlights:
 - Thread-local HTTP sessions with connection pooling
 - Bounded producer/worker/writer pipeline
 - Streaming JSONL output and durable resume index
-- Graceful Ctrl+C shutdown without losing completed results
+- Graceful Ctrl+C shutdown without inventing failed records
+- RPC chain-id preflight prevents mixing nodes from different networks
+- Retry-After supports both seconds and HTTP-date values
 - Input validation, deduplication, optional zero-balance filtering
 - Periodic progress and per-node diagnostics
 
@@ -35,7 +37,9 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_DOWN
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
@@ -126,10 +130,12 @@ class NodeState:
     score: float = 0.0
     cooldown_until: float = 0.0
     fail_streak: int = 0
+    success_streak: int = 0
     success_count: int = 0
     fail_count: int = 0
     rate_limit_count: int = 0
     inflight: int = 0
+    current_limit: int = 1
     ewma_latency_ms: Optional[float] = None
 
 
@@ -161,7 +167,9 @@ class NodeManager:
 
         self.nodes = list(nodes)
         self.per_node_limit = per_node_limit
-        self.state: Dict[str, NodeState] = {node: NodeState() for node in self.nodes}
+        self.state: Dict[str, NodeState] = {
+            node: NodeState(current_limit=per_node_limit) for node in self.nodes
+        }
         self._cv = threading.Condition()
 
     def acquire_node(
@@ -179,7 +187,7 @@ class NodeManager:
                     for node in self.nodes
                     if node not in excluded
                     and self.state[node].cooldown_until <= now
-                    and self.state[node].inflight < self.per_node_limit
+                    and self.state[node].inflight < self.state[node].current_limit
                 ]
 
                 if eligible:
@@ -225,15 +233,25 @@ class NodeManager:
 
             if success:
                 state.success_count += 1
+                state.success_streak += 1
                 state.fail_streak = 0
                 state.score = max(0.0, state.score * 0.92 - 0.25)
+
+                # Additive recovery after sustained success. A node that was
+                # throttled by 429s slowly earns its configured concurrency back.
+                if state.current_limit < self.per_node_limit and state.success_streak >= 20:
+                    state.current_limit += 1
+                    state.success_streak = 0
             else:
                 state.fail_count += 1
                 state.fail_streak += 1
+                state.success_streak = 0
 
                 if rate_limited:
                     state.rate_limit_count += 1
                     state.score += 10.0
+                    # Multiplicative decrease: stop hammering a throttled RPC.
+                    state.current_limit = max(1, state.current_limit // 2)
                     cooldown = BASE_COOLDOWN_SEC * (3.0 + state.fail_streak * 2.0)
                 elif server_error:
                     state.score += 5.0
@@ -255,7 +273,7 @@ class NodeManager:
     def _effective_score(self, node: str) -> float:
         state = self.state[node]
         latency_penalty = (state.ewma_latency_ms or 0.0) / 750.0
-        utilization_penalty = (state.inflight / self.per_node_limit) * 4.0
+        utilization_penalty = (state.inflight / max(1, state.current_limit)) * 4.0
         return state.score + state.fail_streak * 4.0 + latency_penalty + utilization_penalty
 
     def snapshot(self) -> dict:
@@ -269,6 +287,7 @@ class NodeManager:
                     "fail": state.fail_count,
                     "429": state.rate_limit_count,
                     "inflight": state.inflight,
+                    "limit": state.current_limit,
                     "latency_ms": (
                         round(state.ewma_latency_ms, 1)
                         if state.ewma_latency_ms is not None
@@ -459,12 +478,22 @@ def parse_rpc_item(item: object, address: str) -> BalanceResult:
 
 
 def _retry_after_seconds(response: requests.Response) -> Optional[float]:
+    """Parse Retry-After in either delta-seconds or HTTP-date form."""
     value = response.headers.get("Retry-After")
     if not value:
         return None
+
     try:
         return max(0.0, float(value))
     except ValueError:
+        pass
+
+    try:
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -640,18 +669,24 @@ def fetch_batch(
         if pending and attempt < max_retries and not stop_event.is_set():
             stop_event.wait(min(3.0, 0.15 * (2 ** (attempt - 1)) + random.uniform(0.05, 0.35)))
 
-    for address in pending:
-        completed[address] = BalanceResult(
-            address=address,
-            balance_wei=None,
-            balance_eth=None,
-            error=f"FAILED_AFTER_{max_retries}_ATTEMPTS: {last_error}",
-            latency_ms=0.0,
-            node=None,
-            attempts=max_retries,
-        )
+    # On an intentional shutdown, leave unresolved addresses absent from the
+    # result list. They remain unfinished and will be retried on the next run.
+    # This avoids polluting JSONL with synthetic FAILED_AFTER_* records caused
+    # solely by Ctrl+C / SIGTERM.
+    if not stop_event.is_set():
+        for address in pending:
+            completed[address] = BalanceResult(
+                address=address,
+                balance_wei=None,
+                balance_eth=None,
+                error=f"FAILED_AFTER_{max_retries}_ATTEMPTS: {last_error}",
+                latency_ms=0.0,
+                node=None,
+                attempts=max_retries,
+            )
 
-    # Preserve original input order.
+    # Preserve original input order. Missing addresses are intentionally
+    # unfinished (possible only during shutdown).
     return [completed[address] for address in addresses if address in completed]
 
 
@@ -701,6 +736,108 @@ def load_done(out_path: Path, done_path: Path) -> Set[str]:
                 except (ValueError, TypeError, json.JSONDecodeError):
                     continue
     return done
+
+
+def _fetch_chain_id(
+    node: str,
+    timeout: Tuple[float, float],
+    user_agent: str,
+) -> int:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
+    response = get_session(user_agent).post(node, json=payload, timeout=timeout)
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP_{response.status_code}")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("BAD_JSON") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("BAD_CHAIN_ID_RESPONSE")
+    if "error" in data:
+        err = data.get("error")
+        if isinstance(err, dict):
+            raise RuntimeError(
+                f"RPC_ERROR[{err.get('code')}]: {str(err.get('message', ''))[:160]}"
+            )
+        raise RuntimeError(f"RPC_ERROR: {str(err)[:160]}")
+    raw = data.get("result")
+    if not isinstance(raw, str) or not raw.startswith("0x"):
+        raise RuntimeError("BAD_CHAIN_ID_RESULT")
+    try:
+        return int(raw, 16)
+    except ValueError as exc:
+        raise RuntimeError("BAD_CHAIN_ID_HEX") from exc
+
+
+def preflight_nodes(
+    nodes: Sequence[str],
+    timeout: Tuple[float, float],
+    user_agent: str,
+    expected_chain_id: Optional[int],
+) -> List[str]:
+    """Keep only reachable RPC nodes on one verified chain.
+
+    If --expected-chain-id is omitted, the chain used by the largest number of
+    responsive nodes wins. This prevents a single accidentally configured RPC
+    for another EVM network from returning perfectly valid but wrong balances.
+    """
+    if not nodes:
+        return []
+
+    results: Dict[str, int] = {}
+    failures: Dict[str, str] = {}
+    max_workers = min(16, len(nodes))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="preflight") as executor:
+        future_to_node = {
+            executor.submit(_fetch_chain_id, node, timeout, user_agent): node
+            for node in nodes
+        }
+        for future, node in list((future, future_to_node[future]) for future in future_to_node):
+            try:
+                results[node] = future.result()
+            except Exception as exc:
+                failures[node] = f"{type(exc).__name__}: {str(exc)[:180]}"
+
+    if not results:
+        details = "; ".join(f"{mask_url(node)}={reason}" for node, reason in failures.items())
+        raise SystemExit(f"RPC preflight failed: no node returned eth_chainId. {details}")
+
+    if expected_chain_id is None:
+        counts: Dict[int, int] = {}
+        for chain_id in results.values():
+            counts[chain_id] = counts.get(chain_id, 0) + 1
+        target_chain_id = max(counts, key=lambda cid: (counts[cid], -cid))
+    else:
+        if expected_chain_id < 0:
+            raise SystemExit("--expected-chain-id must be >= 0")
+        target_chain_id = expected_chain_id
+
+    accepted = [node for node in nodes if results.get(node) == target_chain_id]
+
+    for node, chain_id in results.items():
+        if chain_id != target_chain_id:
+            logging.warning(
+                "Dropping RPC on wrong chain: %s | chain_id=%d | expected=%d",
+                mask_url(node),
+                chain_id,
+                target_chain_id,
+            )
+    for node, reason in failures.items():
+        logging.warning("Dropping RPC that failed preflight: %s | %s", mask_url(node), reason)
+
+    if not accepted:
+        seen = sorted(set(results.values()))
+        raise SystemExit(
+            f"RPC preflight found no node for chain_id={target_chain_id}; responsive chain IDs: {seen}"
+        )
+
+    logging.info(
+        "RPC preflight: chain_id=%d | accepted=%d/%d",
+        target_chain_id,
+        len(accepted),
+        len(nodes),
+    )
+    return accepted
 
 
 def parse_nodes(raw: str) -> List[str]:
@@ -927,7 +1064,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["latest", "safe", "finalized", "pending"],
         help="Block tag used by eth_getBalance",
     )
-    parser.add_argument("--user-agent", default="eth-balance-checker/3.0")
+    parser.add_argument("--user-agent", default="eth-balance-checker/4.0")
+    parser.add_argument(
+        "--expected-chain-id",
+        type=int,
+        default=None,
+        help=(
+            "Require this EVM chain ID during RPC preflight. If omitted, the "
+            "majority chain among responsive RPC nodes is selected automatically"
+        ),
+    )
+    parser.add_argument(
+        "--skip-node-preflight",
+        action="store_true",
+        help="Skip eth_chainId verification of RPC nodes (less safe)",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -949,6 +1100,15 @@ def main() -> int:
         raise SystemExit(str(exc)) from exc
     if not nodes:
         raise SystemExit("No RPC nodes provided. Use --nodes or RPC_URLS.")
+
+    timeout = (args.connect_timeout, args.read_timeout)
+    if not args.skip_node_preflight:
+        nodes = preflight_nodes(
+            nodes,
+            timeout=timeout,
+            user_agent=args.user_agent,
+            expected_chain_id=args.expected_chain_id,
+        )
 
     validate_args(args, len(nodes))
 
@@ -980,7 +1140,7 @@ def main() -> int:
         node_concurrency=args.node_concurrency,
         out_path=output_path,
         done_path=done_path,
-        timeout=(args.connect_timeout, args.read_timeout),
+        timeout=timeout,
         fsync=args.fsync,
         write_errors=not args.no_error_output,
         nonzero_only=args.nonzero_only,
