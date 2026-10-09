@@ -471,6 +471,8 @@ def parse_rpc_item(item: object, address: str) -> BalanceResult:
 
     try:
         wei = int(raw, 16)
+        if wei < 0:
+            raise ValueError("negative balance")
     except ValueError:
         return BalanceResult(address, None, None, f"BAD_HEX_BALANCE: {raw[:80]}", 0.0)
 
@@ -546,7 +548,7 @@ def _call_rpc_batch_once(
         if not isinstance(item, dict):
             continue
         item_id = item.get("id")
-        if isinstance(item_id, int) and 0 <= item_id < len(addresses):
+        if type(item_id) is int and 0 <= item_id < len(addresses) and item_id not in mapping:
             mapping[item_id] = item
 
     return [
@@ -847,7 +849,7 @@ def parse_nodes(raw: str) -> List[str]:
         if not node:
             continue
         parts = urlsplit(node)
-        if parts.scheme not in {"http", "https"} or not parts.netloc:
+        if parts.scheme not in {"http", "https"} or not parts.netloc or not parts.hostname or parts.fragment:
             raise ValueError(f"Invalid RPC URL: {mask_url(node)}")
         nodes.append(node)
     return list(dict.fromkeys(nodes))
@@ -878,7 +880,7 @@ def validate_args(args: argparse.Namespace, node_count: int) -> None:
         raise SystemExit("--retries must be >= 1")
     if args.node_concurrency < 1:
         raise SystemExit("--node-concurrency must be >= 1")
-    if args.connect_timeout <= 0 or args.read_timeout <= 0:
+    if not (0 < args.connect_timeout < float("inf")) or not (0 < args.read_timeout < float("inf")):
         raise SystemExit("timeouts must be > 0")
     if args.max_inflight < args.workers:
         logging.warning("--max-inflight is below --workers; effective parallelism will be limited")
@@ -946,8 +948,10 @@ def run(
             stop_event.set()
             node_mgr.wake_all()
 
-    previous_sigint = signal.signal(signal.SIGINT, request_stop)
-    previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+    install_signals = threading.current_thread() is threading.main_thread()
+    if install_signals:
+        previous_sigint = signal.signal(signal.SIGINT, request_stop)
+        previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
 
     batches = iter(batched(remaining, batch_size))
     futures: Set[Future[List[BalanceResult]]] = set()
@@ -1013,9 +1017,12 @@ def run(
         for future in futures:
             future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
-        writer.stop()
-        signal.signal(signal.SIGINT, previous_sigint)
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        try:
+            writer.stop()
+        finally:
+            if install_signals:
+                signal.signal(signal.SIGINT, previous_sigint)
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
     done, ok, errors, speed, _ = stats.snapshot()
     logging.info(
@@ -1102,6 +1109,7 @@ def main() -> int:
         raise SystemExit("No RPC nodes provided. Use --nodes or RPC_URLS.")
 
     timeout = (args.connect_timeout, args.read_timeout)
+    validate_args(args, len(nodes))
     if not args.skip_node_preflight:
         nodes = preflight_nodes(
             nodes,
